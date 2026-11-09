@@ -3,7 +3,9 @@ import { InjectModel } from "@nestjs/mongoose";
 import type { ExecutedTrade, OpenPosition } from "@polymarket-copy/shared";
 import type { Model } from "mongoose";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
+import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
 import { EventsGateway } from "../gateway/events.gateway.ts";
+import { DiscordNotifierService } from "../notifications/discord-notifier.service.ts";
 
 @Injectable()
 export class PositionsService {
@@ -12,8 +14,24 @@ export class PositionsService {
   constructor(
     @InjectModel(PositionModel.name)
     private readonly positionModel: Model<PositionDocument>,
-    private readonly eventsGateway: EventsGateway
+    @InjectModel(TargetModel.name)
+    private readonly targetModel: Model<TargetDocument>,
+    private readonly eventsGateway: EventsGateway,
+    private readonly discordNotifier: DiscordNotifierService
   ) {}
+
+  private async getTargetAlias(address?: string): Promise<string | undefined> {
+    if (!address) return undefined;
+    try {
+      const target = await this.targetModel
+        .findOne({ address: address.toLowerCase() })
+        .lean()
+        .exec();
+      return target?.alias;
+    } catch (_err: unknown) {
+      return undefined;
+    }
+  }
 
   async resolveMarketEndDate(
     conditionId: string,
@@ -127,6 +145,11 @@ export class PositionsService {
               settledPayoutUsdc,
               realizedPnlUsdc,
             });
+
+            // Notification Discord enrichie
+            const mapped = this.mapToPosition(pos.toObject());
+            const alias = await this.getTargetAlias(pos.targetAddress);
+            await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
           }
         }
       } catch (_err: unknown) {
@@ -300,6 +323,11 @@ export class PositionsService {
         settledPayoutUsdc: proceeds,
         realizedPnlUsdc: existing.realizedPnlUsdc,
       });
+
+      // Notification Discord enrichie
+      const mapped = this.mapToPosition(existing.toObject());
+      const alias = await this.getTargetAlias(existing.targetAddress);
+      await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
       return null;
     }
 
