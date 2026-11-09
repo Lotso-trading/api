@@ -1,0 +1,360 @@
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { InjectModel } from "@nestjs/mongoose";
+import type { ExecutedTrade, OpenPosition } from "@polymarket-copy/shared";
+import type { Model } from "mongoose";
+import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
+import { EventsGateway } from "../gateway/events.gateway.ts";
+
+@Injectable()
+export class PositionsService {
+  private readonly marketEndDateCache = new Map<string, string>();
+
+  constructor(
+    @InjectModel(PositionModel.name)
+    private readonly positionModel: Model<PositionDocument>,
+    private readonly eventsGateway: EventsGateway
+  ) {}
+
+  async resolveMarketEndDate(
+    conditionId: string,
+    marketSlug?: string
+  ): Promise<string | undefined> {
+    if (!conditionId || conditionId === "0x") return undefined;
+    const cached = this.marketEndDateCache.get(conditionId);
+    if (cached !== undefined) {
+      return cached || undefined;
+    }
+
+    try {
+      const res = await fetch(`https://clob.polymarket.com/markets/${conditionId}`, {
+        signal: AbortSignal.timeout(2500),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          end_date_iso?: string;
+          game_start_time?: string;
+        };
+        const resolved = data.end_date_iso || data.game_start_time;
+        if (resolved) {
+          this.marketEndDateCache.set(conditionId, resolved);
+          return resolved;
+        }
+      }
+    } catch (_err: unknown) {
+      // Fallback vers Gamma
+    }
+
+    if (marketSlug && marketSlug !== "market" && marketSlug !== "polygon-onchain") {
+      try {
+        const res = await fetch(
+          `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(marketSlug)}`,
+          { signal: AbortSignal.timeout(2500) }
+        );
+        if (res.ok) {
+          const list = (await res.json()) as Array<{
+            endDate?: string;
+            endDateIso?: string;
+          }>;
+          const resolved = list[0]?.endDate || list[0]?.endDateIso;
+          if (resolved) {
+            this.marketEndDateCache.set(conditionId, resolved);
+            return resolved;
+          }
+        }
+      } catch (_err: unknown) {
+        // Ignorer les erreurs réseau
+      }
+    }
+
+    this.marketEndDateCache.set(conditionId, "");
+    return undefined;
+  }
+
+  async settleResolvedPositions(): Promise<number> {
+    const openPositions = await this.positionModel
+      .find({
+        status: { $ne: "CLOSED" },
+        totalShares: { $gt: 0 },
+      })
+      .exec();
+
+    let settledCount = 0;
+
+    for (const pos of openPositions) {
+      if (!pos.conditionId || pos.conditionId === "0x") continue;
+
+      try {
+        const res = await fetch(`https://clob.polymarket.com/markets/${pos.conditionId}`, {
+          signal: AbortSignal.timeout(3000),
+        });
+
+        if (!res.ok) continue;
+
+        const data = (await res.json()) as {
+          closed?: boolean;
+          tokens?: Array<{
+            outcome?: string;
+            winner?: boolean;
+          }>;
+        };
+
+        if (data.closed === true && Array.isArray(data.tokens) && data.tokens.length > 0) {
+          const winningToken = data.tokens.find((t) => t.winner === true);
+          if (winningToken?.outcome) {
+            const isWin =
+              pos.outcomeLabel.trim().toLowerCase() === winningToken.outcome.trim().toLowerCase();
+
+            const settledPayoutUsdc = isWin ? Number(pos.totalShares.toFixed(2)) : 0;
+            const realizedPnlUsdc = settledPayoutUsdc - pos.totalInvestedUsdc;
+            const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
+
+            pos.status = "CLOSED";
+            pos.closeReason = closeReason;
+            pos.settledPayoutUsdc = settledPayoutUsdc;
+            pos.realizedPnlUsdc = realizedPnlUsdc;
+            pos.currentMarketPrice = isWin ? 1.0 : 0.0;
+            pos.currentMarketValueUsdc = settledPayoutUsdc;
+            pos.closedAt = Date.now();
+            pos.updatedAt = Date.now();
+
+            await pos.save();
+            settledCount++;
+
+            this.eventsGateway.broadcast("position:closed", {
+              conditionId: pos.conditionId,
+              positionId: pos.positionId,
+              closeReason,
+              settledPayoutUsdc,
+              realizedPnlUsdc,
+            });
+          }
+        }
+      } catch (_err: unknown) {
+        // Ignorer les timeouts ponctuels
+      }
+    }
+
+    return settledCount;
+  }
+
+  async findAll(): Promise<OpenPosition[]> {
+    // Vérification automatique des résolutions pour les marchés terminés
+    try {
+      await this.settleResolvedPositions();
+    } catch (_err: unknown) {
+      // Ne bloque pas la lecture si Polymarket est temporairement inaccessible
+    }
+
+    const docs = await this.positionModel
+      .find({
+        status: { $ne: "CLOSED" },
+        totalShares: { $gt: 0 },
+      })
+      .sort({ updatedAt: -1 })
+      .lean()
+      .exec();
+
+    // Résolution paresseuse des dates d'échéance manquantes
+    await Promise.all(
+      docs.map(async (doc) => {
+        if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
+          const resolvedDate = await this.resolveMarketEndDate(doc.conditionId, doc.marketSlug);
+          if (resolvedDate) {
+            doc.endDate = resolvedDate;
+            await this.positionModel.updateOne(
+              { _id: doc._id },
+              { $set: { endDate: resolvedDate } }
+            );
+          }
+        }
+      })
+    );
+
+    return docs.map((doc) => this.mapToPosition(doc));
+  }
+
+  async findClosed(): Promise<OpenPosition[]> {
+    const docs = await this.positionModel
+      .find({ status: "CLOSED" })
+      .sort({ closedAt: -1, updatedAt: -1 })
+      .limit(100)
+      .lean()
+      .exec();
+
+    return docs.map((doc) => this.mapToPosition(doc));
+  }
+
+  async findById(id: string): Promise<OpenPosition> {
+    const doc = await this.positionModel.findById(id).lean().exec();
+    if (!doc) {
+      throw new NotFoundException(`Position introuvable avec l'ID ${id}`);
+    }
+    return this.mapToPosition(doc);
+  }
+
+  async findByMarket(conditionId: string, assetAddress: string): Promise<OpenPosition | null> {
+    const doc = await this.positionModel
+      .findOne({
+        conditionId,
+        assetAddress: assetAddress.toLowerCase(),
+      })
+      .lean()
+      .exec();
+    return doc ? this.mapToPosition(doc) : null;
+  }
+
+  async recordBuy(
+    trade: ExecutedTrade,
+    marketInfo?: {
+      marketSlug?: string;
+      marketQuestion?: string;
+      outcomeLabel?: string;
+      endDate?: string;
+    }
+  ): Promise<OpenPosition> {
+    const existing = await this.positionModel.findOne({
+      conditionId: trade.conditionId,
+    });
+
+    let savedDoc: PositionDocument;
+
+    if (!existing || existing.status === "CLOSED") {
+      const positionId = `pos_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const resolvedEndDate =
+        marketInfo?.endDate ||
+        (await this.resolveMarketEndDate(trade.conditionId, marketInfo?.marketSlug));
+
+      const newPos = new this.positionModel({
+        positionId,
+        conditionId: trade.conditionId,
+        assetAddress: trade.conditionId.toLowerCase(),
+        marketSlug: marketInfo?.marketSlug || "market",
+        marketQuestion: marketInfo?.marketQuestion || "Polymarket Question",
+        outcomeLabel: marketInfo?.outcomeLabel || "Yes",
+        endDate: resolvedEndDate,
+        status: "OPEN",
+        totalShares: trade.shares,
+        avgEntryPrice: trade.executedPrice,
+        totalInvestedUsdc: trade.costUsdc,
+        currentMarketPrice: trade.executedPrice,
+        currentMarketValueUsdc: trade.costUsdc,
+        unrealizedPnlUsdc: 0,
+        unrealizedPnlPercent: 0,
+        targetAddress: trade.targetAddress.toLowerCase(),
+        openedAt: trade.executedAt,
+        updatedAt: trade.executedAt,
+      });
+      savedDoc = await newPos.save();
+    } else {
+      const newTotalShares = existing.totalShares + trade.shares;
+      const newTotalInvested = existing.totalInvestedUsdc + trade.costUsdc;
+      const newAvgPrice =
+        newTotalShares > 0 ? newTotalInvested / newTotalShares : existing.avgEntryPrice;
+
+      existing.totalShares = newTotalShares;
+      existing.totalInvestedUsdc = newTotalInvested;
+      existing.avgEntryPrice = newAvgPrice;
+      existing.currentMarketPrice = trade.executedPrice;
+      existing.currentMarketValueUsdc = newTotalShares * trade.executedPrice;
+      existing.unrealizedPnlUsdc = existing.currentMarketValueUsdc - newTotalInvested;
+      existing.unrealizedPnlPercent =
+        newTotalInvested > 0 ? (existing.unrealizedPnlUsdc / newTotalInvested) * 100 : 0;
+      existing.updatedAt = trade.executedAt;
+      if (!existing.endDate && marketInfo?.endDate) {
+        existing.endDate = marketInfo.endDate;
+      }
+      savedDoc = await existing.save();
+    }
+
+    const result = this.mapToPosition(savedDoc.toObject());
+    this.eventsGateway.broadcast("position:updated", result);
+    return result;
+  }
+
+  async recordSell(trade: ExecutedTrade): Promise<OpenPosition | null> {
+    const existing = await this.positionModel.findOne({
+      conditionId: trade.conditionId,
+      status: { $ne: "CLOSED" },
+    });
+
+    if (!existing) return null;
+
+    const remainingShares = Math.max(0, existing.totalShares - trade.shares);
+    if (remainingShares === 0) {
+      const proceeds = Math.round(trade.costUsdc * 100) / 100;
+      existing.status = "CLOSED";
+      existing.closeReason = "WHALE_SELL";
+      existing.settledPayoutUsdc = proceeds;
+      existing.realizedPnlUsdc = proceeds - existing.totalInvestedUsdc;
+      existing.totalShares = 0;
+      existing.currentMarketValueUsdc = 0;
+      existing.closedAt = trade.executedAt;
+      existing.updatedAt = trade.executedAt;
+
+      await existing.save();
+
+      this.eventsGateway.broadcast("position:closed", {
+        conditionId: trade.conditionId,
+        positionId: existing.positionId,
+        closeReason: "WHALE_SELL",
+        settledPayoutUsdc: proceeds,
+        realizedPnlUsdc: existing.realizedPnlUsdc,
+      });
+      return null;
+    }
+
+    const ratioRemaining = remainingShares / existing.totalShares;
+    existing.totalShares = remainingShares;
+    existing.totalInvestedUsdc = existing.totalInvestedUsdc * ratioRemaining;
+    existing.currentMarketPrice = trade.executedPrice;
+    existing.currentMarketValueUsdc = remainingShares * trade.executedPrice;
+    existing.unrealizedPnlUsdc = existing.currentMarketValueUsdc - existing.totalInvestedUsdc;
+    existing.unrealizedPnlPercent =
+      existing.totalInvestedUsdc > 0
+        ? (existing.unrealizedPnlUsdc / existing.totalInvestedUsdc) * 100
+        : 0;
+    existing.updatedAt = trade.executedAt;
+
+    const saved = await existing.save();
+    const result = this.mapToPosition(saved.toObject());
+    this.eventsGateway.broadcast("position:updated", result);
+    return result;
+  }
+
+  async clearPositions(): Promise<void> {
+    await this.positionModel.deleteMany({});
+    this.eventsGateway.broadcast("positions:cleared", {});
+  }
+
+  private mapToPosition(rawDoc: unknown): OpenPosition {
+    const doc = rawDoc as Record<string, unknown>;
+    const statusVal = doc.status === "CLOSED" ? "CLOSED" : "OPEN";
+    const closeReasonVal = doc.closeReason ? String(doc.closeReason) : undefined;
+
+    return {
+      id: String(doc.positionId ?? doc._id),
+      conditionId: String(doc.conditionId),
+      assetAddress: String(doc.assetAddress),
+      marketSlug: String(doc.marketSlug),
+      marketQuestion: String(doc.marketQuestion),
+      outcomeLabel: String(doc.outcomeLabel),
+      endDate: doc.endDate ? String(doc.endDate) : undefined,
+      status: statusVal,
+      closeReason: closeReasonVal as OpenPosition["closeReason"],
+      settledPayoutUsdc:
+        doc.settledPayoutUsdc !== undefined ? Number(doc.settledPayoutUsdc) : undefined,
+      realizedPnlUsdc: doc.realizedPnlUsdc !== undefined ? Number(doc.realizedPnlUsdc) : undefined,
+      closedAt: doc.closedAt ? Number(doc.closedAt) : undefined,
+      totalShares: Number(doc.totalShares),
+      avgEntryPrice: Number(doc.avgEntryPrice),
+      totalInvestedUsdc: Number(doc.totalInvestedUsdc),
+      currentMarketPrice: Number(doc.currentMarketPrice),
+      currentMarketValueUsdc: Number(doc.currentMarketValueUsdc),
+      unrealizedPnlUsdc: Number(doc.unrealizedPnlUsdc),
+      unrealizedPnlPercent: Number(doc.unrealizedPnlPercent),
+      targetAddress: String(doc.targetAddress),
+      openedAt: Number(doc.openedAt),
+      updatedAt: Number(doc.updatedAt),
+    };
+  }
+}
