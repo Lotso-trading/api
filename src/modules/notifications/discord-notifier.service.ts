@@ -9,6 +9,8 @@ import {
 @Injectable()
 export class DiscordNotifierService {
   private readonly webhookUrl?: string;
+  private readonly notifiedPositions = new Map<string, number>();
+  private readonly dedupTtlMs = 10 * 60 * 1000; // 10 minutes
 
   constructor() {
     this.webhookUrl =
@@ -18,8 +20,29 @@ export class DiscordNotifierService {
       undefined;
   }
 
+  private cleanExpiredDedupEntries(now: number): void {
+    for (const [key, timestamp] of this.notifiedPositions.entries()) {
+      if (now - timestamp > this.dedupTtlMs) {
+        this.notifiedPositions.delete(key);
+      }
+    }
+  }
+
   async sendClosedPositionAlert(position: OpenPosition, targetAlias?: string): Promise<void> {
     if (!this.webhookUrl) return;
+
+    const dedupKey = position.id || position.conditionId;
+    const now = Date.now();
+    this.cleanExpiredDedupEntries(now);
+
+    if (dedupKey && this.notifiedPositions.has(dedupKey)) {
+      console.log(`[DiscordNotifier] Alerte clôture ignorée (doublon dédupliqué): ${dedupKey}`);
+      return;
+    }
+
+    if (dedupKey) {
+      this.notifiedPositions.set(dedupKey, now);
+    }
 
     try {
       const payload = buildClosedPositionEmbed(position, targetAlias);

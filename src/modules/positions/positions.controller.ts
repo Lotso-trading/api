@@ -18,7 +18,7 @@ export class PositionsController {
 
   @Post("settle")
   async settle(): Promise<{ settledCount: number; message: string }> {
-    const settledCount = await this.positionsService.settleResolvedPositions();
+    const settledCount = await this.positionsService.settleResolvedPositions(true);
     return {
       settledCount,
       message: `${settledCount} position(s) résolue(s) et créditée(s) au cash disponible.`,

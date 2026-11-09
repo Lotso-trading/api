@@ -25,6 +25,6 @@
   "tasks": {
     "dev": "deno run -A --unsafe-proto --watch src/main.ts",
     "start": "deno run -A --unsafe-proto src/main.ts",
-    "test": "deno test tests/"
+    "test": "deno test -A --unsafe-proto tests/"
   }
 }

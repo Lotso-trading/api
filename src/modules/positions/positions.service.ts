@@ -10,6 +10,9 @@ import { DiscordNotifierService } from "../notifications/discord-notifier.servic
 @Injectable()
 export class PositionsService {
   private readonly marketEndDateCache = new Map<string, string>();
+  private settlePromise: Promise<number> | null = null;
+  private lastAutoSettleTimestamp = 0;
+  private readonly autoSettleThrottleMs = 30_000; // Throttling 30s entre deux vérifications automatiques
 
   constructor(
     @InjectModel(PositionModel.name)
@@ -88,7 +91,27 @@ export class PositionsService {
     return undefined;
   }
 
-  async settleResolvedPositions(): Promise<number> {
+  async settleResolvedPositions(force = false): Promise<number> {
+    const now = Date.now();
+    // Si ce n'est pas un appel forcé (ex: clic utilisateur), on applique le throttling
+    if (!force && now - this.lastAutoSettleTimestamp < this.autoSettleThrottleMs) {
+      return 0;
+    }
+
+    // Single-Flight : si une exécution est déjà en cours, partager la promesse en vol
+    if (this.settlePromise) {
+      return await this.settlePromise;
+    }
+
+    this.lastAutoSettleTimestamp = now;
+    this.settlePromise = this.executeSettleResolvedPositions().finally(() => {
+      this.settlePromise = null;
+    });
+
+    return await this.settlePromise;
+  }
+
+  private async executeSettleResolvedPositions(): Promise<number> {
     const openPositions = await this.positionModel
       .find({
         status: { $ne: "CLOSED" },
@@ -125,30 +148,47 @@ export class PositionsService {
             const settledPayoutUsdc = isWin ? Number(pos.totalShares.toFixed(2)) : 0;
             const realizedPnlUsdc = settledPayoutUsdc - pos.totalInvestedUsdc;
             const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
+            const now = Date.now();
 
-            pos.status = "CLOSED";
-            pos.closeReason = closeReason;
-            pos.settledPayoutUsdc = settledPayoutUsdc;
-            pos.realizedPnlUsdc = realizedPnlUsdc;
-            pos.currentMarketPrice = isWin ? 1.0 : 0.0;
-            pos.currentMarketValueUsdc = settledPayoutUsdc;
-            pos.closedAt = Date.now();
-            pos.updatedAt = Date.now();
+            // Mise à jour conditionnelle atomique : garantit l'idempotence stricte
+            const updatedDoc = await this.positionModel.findOneAndUpdate(
+              {
+                _id: pos._id,
+                status: { $ne: "CLOSED" },
+              },
+              {
+                $set: {
+                  status: "CLOSED",
+                  closeReason,
+                  settledPayoutUsdc,
+                  realizedPnlUsdc,
+                  currentMarketPrice: isWin ? 1.0 : 0.0,
+                  currentMarketValueUsdc: settledPayoutUsdc,
+                  closedAt: now,
+                  updatedAt: now,
+                },
+              },
+              { new: true }
+            );
 
-            await pos.save();
+            // Si null, un autre thread ou une exécution concurrente a déjà clôturé la position
+            if (!updatedDoc) {
+              continue;
+            }
+
             settledCount++;
 
             this.eventsGateway.broadcast("position:closed", {
-              conditionId: pos.conditionId,
-              positionId: pos.positionId,
+              conditionId: updatedDoc.conditionId,
+              positionId: updatedDoc.positionId,
               closeReason,
               settledPayoutUsdc,
               realizedPnlUsdc,
             });
 
-            // Notification Discord enrichie
-            const mapped = this.mapToPosition(pos.toObject());
-            const alias = await this.getTargetAlias(pos.targetAddress);
+            // Notification Discord enrichie (une seule fois garantie)
+            const mapped = this.mapToPosition(updatedDoc.toObject());
+            const alias = await this.getTargetAlias(updatedDoc.targetAddress);
             await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
           }
         }
@@ -161,9 +201,9 @@ export class PositionsService {
   }
 
   async findAll(): Promise<OpenPosition[]> {
-    // Vérification automatique des résolutions pour les marchés terminés
+    // Vérification automatique des résolutions avec throttling (non bloquante)
     try {
-      await this.settleResolvedPositions();
+      await this.settleResolvedPositions(false);
     } catch (_err: unknown) {
       // Ne bloque pas la lecture si Polymarket est temporairement inaccessible
     }
@@ -305,28 +345,41 @@ export class PositionsService {
     const remainingShares = Math.max(0, existing.totalShares - trade.shares);
     if (remainingShares === 0) {
       const proceeds = Math.round(trade.costUsdc * 100) / 100;
-      existing.status = "CLOSED";
-      existing.closeReason = "WHALE_SELL";
-      existing.settledPayoutUsdc = proceeds;
-      existing.realizedPnlUsdc = proceeds - existing.totalInvestedUsdc;
-      existing.totalShares = 0;
-      existing.currentMarketValueUsdc = 0;
-      existing.closedAt = trade.executedAt;
-      existing.updatedAt = trade.executedAt;
+      const realizedPnlUsdc = proceeds - existing.totalInvestedUsdc;
 
-      await existing.save();
+      const updated = await this.positionModel.findOneAndUpdate(
+        {
+          _id: existing._id,
+          status: { $ne: "CLOSED" },
+        },
+        {
+          $set: {
+            status: "CLOSED",
+            closeReason: "WHALE_SELL",
+            settledPayoutUsdc: proceeds,
+            realizedPnlUsdc,
+            totalShares: 0,
+            currentMarketValueUsdc: 0,
+            closedAt: trade.executedAt,
+            updatedAt: trade.executedAt,
+          },
+        },
+        { new: true }
+      );
+
+      if (!updated) return null;
 
       this.eventsGateway.broadcast("position:closed", {
         conditionId: trade.conditionId,
-        positionId: existing.positionId,
+        positionId: updated.positionId,
         closeReason: "WHALE_SELL",
         settledPayoutUsdc: proceeds,
-        realizedPnlUsdc: existing.realizedPnlUsdc,
+        realizedPnlUsdc: updated.realizedPnlUsdc,
       });
 
-      // Notification Discord enrichie
-      const mapped = this.mapToPosition(existing.toObject());
-      const alias = await this.getTargetAlias(existing.targetAddress);
+      // Notification Discord enrichie (une seule fois garantie)
+      const mapped = this.mapToPosition(updated.toObject());
+      const alias = await this.getTargetAlias(updated.targetAddress);
       await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
       return null;
     }
