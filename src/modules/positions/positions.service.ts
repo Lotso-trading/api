@@ -201,12 +201,10 @@ export class PositionsService {
   }
 
   async findAll(): Promise<OpenPosition[]> {
-    // Vérification automatique des résolutions avec throttling (non bloquante)
-    try {
-      await this.settleResolvedPositions(false);
-    } catch (_err: unknown) {
-      // Ne bloque pas la lecture si Polymarket est temporairement inaccessible
-    }
+    // Déclenchement asynchrone en arrière-plan sans bloquer la requête HTTP
+    this.settleResolvedPositions(false).catch((_err: unknown) => {
+      // Ignorer les erreurs réseau temporaires
+    });
 
     const docs = await this.positionModel
       .find({
