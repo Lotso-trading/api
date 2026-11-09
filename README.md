@@ -20,10 +20,10 @@ Le micro-service `api` est le **centre névralgique de données, de persistance 
   - Diffusion instantanée des trades détectés, validés, exécutés ou rejetés.
   - Télémétrie en direct de l'état du bot et des alertes de risque.
 - **Gestion Complète des Entités Métier** :
-  - *Targets* : CRUD et activation/désactivation des baleines suivies.
-  - *Trades* : Historisation détaillée, déduplication et logs d'exécution.
-  - *Positions* : Suivi dynamique des positions ouvertes et évaluation du PnL non réalisé.
-  - *Config* : Pilotage à chaud des paramètres du RiskManager (slippage, switch `ALL`, pourcentages).
+  - _Targets_ : CRUD et activation/désactivation des baleines suivies.
+  - _Trades_ : Historisation détaillée, déduplication et logs d'exécution.
+  - _Positions_ : Suivi dynamique des positions ouvertes et évaluation du PnL non réalisé.
+  - _Config_ : Pilotage à chaud des paramètres du RiskManager (slippage, switch `ALL`, pourcentages).
 
 ---
 
@@ -53,17 +53,17 @@ src/
 
 ## 🔌 Points d'Accès Principaux (REST & WebSocket)
 
-| Méthode | Endpoint | Description |
-| :--- | :--- | :--- |
-| `GET` | `/targets` | Liste de toutes les baleines surveillées |
-| `POST` | `/targets` | Ajouter une nouvelle baleine cible |
-| `PATCH` | `/targets/:id` | Activer, désactiver ou modifier une cible |
-| `GET` | `/trades` | Historique paginé des trades avec filtres (statut, cible, date) |
-| `GET` | `/positions` | Inventaire des positions ouvertes avec calcul du PnL |
-| `GET` | `/config` | Récupérer la configuration active du RiskManager |
-| `PUT` | `/config` | Mettre à jour les paramètres de risque en direct |
-| `GET` | `/metrics/summary`| Métriques agrégées (PnL total, Win Rate, Volume USDC) |
-| `WS` | `ws://host:port` | Gateway temps réel des événements de trading |
+| Méthode | Endpoint           | Description                                                     |
+| :------ | :----------------- | :-------------------------------------------------------------- |
+| `GET`   | `/targets`         | Liste de toutes les baleines surveillées                        |
+| `POST`  | `/targets`         | Ajouter une nouvelle baleine cible                              |
+| `PATCH` | `/targets/:id`     | Activer, désactiver ou modifier une cible                       |
+| `GET`   | `/trades`          | Historique paginé des trades avec filtres (statut, cible, date) |
+| `GET`   | `/positions`       | Inventaire des positions ouvertes avec calcul du PnL            |
+| `GET`   | `/config`          | Récupérer la configuration active du RiskManager                |
+| `PUT`   | `/config`          | Mettre à jour les paramètres de risque en direct                |
+| `GET`   | `/metrics/summary` | Métriques agrégées (PnL total, Win Rate, Volume USDC)           |
+| `WS`    | `ws://host:port`   | Gateway temps réel des événements de trading                    |
 
 ---
 

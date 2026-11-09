@@ -7,7 +7,10 @@ import type { EventsGateway } from "../src/modules/gateway/events.gateway.ts";
 
 Deno.test("DiscordNotifierService - déduplique et refuse les alertes multiples pour la même position", async () => {
   // Configurer une URL factice de webhook pour le test
-  Deno.env.set("DISCORD_CLOSED_POSITIONS_WEBHOOK_URL", "https://discord.com/api/webhooks/test/mock");
+  Deno.env.set(
+    "DISCORD_CLOSED_POSITIONS_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/test/mock"
+  );
 
   let fetchCallCount = 0;
   const originalFetch = globalThis.fetch;
