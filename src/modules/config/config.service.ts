@@ -1,4 +1,4 @@
-import { Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { RiskConfig, UpdateRiskConfigInput } from "@polymarket-copy/shared";
 import type { Model } from "mongoose";
@@ -6,58 +6,39 @@ import { type ConfigDocument, ConfigModel } from "../../database/schemas/config.
 import { EventsGateway } from "../gateway/events.gateway.ts";
 
 @Injectable()
-export class BotConfigService implements OnModuleInit, OnModuleDestroy {
-  private lastHeartbeatTimestamp = 0;
-  private isExplicitlyShutdown = false;
-  private wasOnline = false;
-  private heartbeatCheckInterval: ReturnType<typeof setInterval> | null = null;
+export class BotConfigService {
+  private isBotOnlineState = false;
 
   constructor(
     @InjectModel(ConfigModel.name)
     private readonly configModel: Model<ConfigDocument>,
     private readonly eventsGateway: EventsGateway
-  ) {}
-
-  onModuleInit(): void {
-    this.heartbeatCheckInterval = setInterval(async () => {
-      const currentlyOnline = this.isBotOnline();
-      if (currentlyOnline !== this.wasOnline) {
-        this.wasOnline = currentlyOnline;
-        const cfg = await this.getConfig();
-        this.eventsGateway.broadcast("config:updated", cfg);
-      }
-    }, 10000);
-  }
-
-  onModuleDestroy(): void {
-    if (this.heartbeatCheckInterval) {
-      clearInterval(this.heartbeatCheckInterval);
-      this.heartbeatCheckInterval = null;
-    }
+  ) {
+    this.eventsGateway.onBotPresenceChange(async (isOnline: boolean) => {
+      this.isBotOnlineState = isOnline;
+      const cfg = await this.getConfig();
+      this.eventsGateway.broadcast("config:updated", cfg);
+    });
   }
 
   isBotOnline(): boolean {
-    if (this.isExplicitlyShutdown) return false;
-    return this.lastHeartbeatTimestamp > 0 && Date.now() - this.lastHeartbeatTimestamp < 30_000;
+    return this.isBotOnlineState || this.eventsGateway.isBotConnected();
+  }
+
+  setBotOnline(isOnline: boolean): void {
+    this.isBotOnlineState = isOnline;
   }
 
   async recordHeartbeat(): Promise<void> {
-    this.lastHeartbeatTimestamp = Date.now();
-    this.isExplicitlyShutdown = false;
-    if (!this.wasOnline) {
-      this.wasOnline = true;
-      const cfg = await this.getConfig();
-      this.eventsGateway.broadcast("config:updated", cfg);
-    }
+    this.setBotOnline(true);
+    const cfg = await this.getConfig();
+    this.eventsGateway.broadcast("config:updated", cfg);
   }
 
   async recordShutdown(): Promise<void> {
-    this.isExplicitlyShutdown = true;
-    if (this.wasOnline) {
-      this.wasOnline = false;
-      const cfg = await this.getConfig();
-      this.eventsGateway.broadcast("config:updated", cfg);
-    }
+    this.setBotOnline(false);
+    const cfg = await this.getConfig();
+    this.eventsGateway.broadcast("config:updated", cfg);
   }
 
   async getConfig(): Promise<RiskConfig> {

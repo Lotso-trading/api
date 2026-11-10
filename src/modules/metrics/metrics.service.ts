@@ -4,6 +4,7 @@ import type { Model } from "mongoose";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
 import { type TradeDocument, TradeModel } from "../../database/schemas/trade.schema.ts";
+import { EventsGateway } from "../gateway/events.gateway.ts";
 
 export interface GlobalMetrics {
   totalTradedVolumeUsdc: number;
@@ -44,8 +45,15 @@ export class MetricsService {
     @InjectModel(PositionModel.name)
     private readonly positionModel: Model<PositionDocument>,
     @InjectModel(TargetModel.name)
-    private readonly targetModel: Model<TargetDocument>
+    private readonly targetModel: Model<TargetDocument>,
+    private readonly eventsGateway: EventsGateway
   ) {}
+
+  async broadcastMetrics(): Promise<GlobalMetrics> {
+    const metrics = await this.getMetrics();
+    this.eventsGateway.broadcast("metrics:updated", metrics);
+    return metrics;
+  }
 
   async getMetrics(): Promise<GlobalMetrics> {
     const [tradeAgg, positionAgg, closedAgg, activeTargetsCount, rejectedCount] = await Promise.all(
