@@ -39,6 +39,12 @@ export class ConfigModel implements RiskConfig {
   @Prop({ required: true, default: true })
   dryRun!: boolean;
 
+  @Prop({ required: true, default: 0 })
+  maxAllocatedCapitalUsdc!: number;
+
+  @Prop({ required: true, default: 50.0 })
+  profitReinvestmentPercent!: number;
+
   @Prop({ required: true, default: true })
   isBotRunning!: boolean;
 

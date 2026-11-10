@@ -28,6 +28,8 @@ export class BotConfigService {
         maxPrice: 0.9,
         copySellOrders: true,
         dryRun: true,
+        maxAllocatedCapitalUsdc: 0,
+        profitReinvestmentPercent: 50.0,
         isBotRunning: true,
       });
       const saved = await created.save();
@@ -45,6 +47,8 @@ export class BotConfigService {
       maxPrice: Number(doc.maxPrice),
       copySellOrders: Boolean(doc.copySellOrders),
       dryRun: Boolean(doc.dryRun),
+      maxAllocatedCapitalUsdc: Number(doc.maxAllocatedCapitalUsdc ?? 0),
+      profitReinvestmentPercent: Number(doc.profitReinvestmentPercent ?? 50.0),
       isBotRunning: Boolean(doc.isBotRunning),
     };
   }
@@ -80,6 +84,12 @@ export class BotConfigService {
               copySellOrders: dto.copySellOrders,
             }),
             ...(dto.dryRun !== undefined && { dryRun: dto.dryRun }),
+            ...(dto.maxAllocatedCapitalUsdc !== undefined && {
+              maxAllocatedCapitalUsdc: dto.maxAllocatedCapitalUsdc,
+            }),
+            ...(dto.profitReinvestmentPercent !== undefined && {
+              profitReinvestmentPercent: dto.profitReinvestmentPercent,
+            }),
           },
         },
         { new: true }
@@ -98,6 +108,8 @@ export class BotConfigService {
       maxPrice: Number(updated?.maxPrice),
       copySellOrders: Boolean(updated?.copySellOrders),
       dryRun: Boolean(updated?.dryRun),
+      maxAllocatedCapitalUsdc: Number(updated?.maxAllocatedCapitalUsdc ?? 0),
+      profitReinvestmentPercent: Number(updated?.profitReinvestmentPercent ?? 50.0),
       isBotRunning: Boolean(updated?.isBotRunning),
     };
 

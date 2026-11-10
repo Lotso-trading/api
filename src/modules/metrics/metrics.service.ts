@@ -11,6 +11,7 @@ export interface GlobalMetrics {
   totalRejectedTrades: number;
   activePositionsCount: number;
   closedPositionsCount: number;
+  initialCapitalUsdc: number;
   totalInvestedUsdc: number;
   currentPositionsValueUsdc: number;
   unrealizedPnlUsdc: number;
@@ -100,7 +101,7 @@ export class MetricsService {
       count: 0,
     };
 
-    const initialCapitalUsdc = 1000.0;
+    const initialCapitalUsdc = Number(Deno.env.get("SIMULATED_BALANCE_USDC")) || 100.0;
     const totalInvestedUsdc = Number(positionStats.totalInvested || 0);
     const realizedPnlUsdc = Number(closedStats.totalRealizedPnl || 0);
     const availableCashUsdc = Math.max(0, initialCapitalUsdc - totalInvestedUsdc + realizedPnlUsdc);
@@ -113,6 +114,7 @@ export class MetricsService {
       totalRejectedTrades: rejectedCount,
       activePositionsCount: positionStats.count || 0,
       closedPositionsCount: closedStats.count || 0,
+      initialCapitalUsdc,
       totalInvestedUsdc,
       currentPositionsValueUsdc,
       unrealizedPnlUsdc: Number(positionStats.totalUnrealizedPnl || 0),
@@ -137,7 +139,7 @@ export class MetricsService {
       .lean()
       .exec();
 
-    const initialCapital = 1000.0;
+    const initialCapital = Number(Deno.env.get("SIMULATED_BALANCE_USDC")) || 100.0;
     let runningCash = initialCapital;
     let runningCumulativePnl = 0.0;
     let runningWhaleVolume = 0.0;
