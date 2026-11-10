@@ -1,9 +1,12 @@
 import "reflect-metadata";
 import { assertEquals } from "jsr:@std/assert";
 import type { OpenPosition } from "@polymarket-copy/shared";
+import type { Model } from "mongoose";
+import type { PositionDocument } from "../src/database/schemas/position.schema.ts";
+import type { TargetDocument } from "../src/database/schemas/target.schema.ts";
+import type { EventsGateway } from "../src/modules/gateway/events.gateway.ts";
 import { DiscordNotifierService } from "../src/modules/notifications/discord-notifier.service.ts";
 import { PositionsService } from "../src/modules/positions/positions.service.ts";
-import type { EventsGateway } from "../src/modules/gateway/events.gateway.ts";
 
 Deno.test("DiscordNotifierService - déduplique et refuse les alertes multiples pour la même position", async () => {
   // Configurer une URL factice de webhook pour le test
@@ -86,8 +89,8 @@ Deno.test("PositionsService - single-flight mutex mutualise les appels concurren
   } as unknown as DiscordNotifierService;
 
   const service = new PositionsService(
-    mockPositionModel as any,
-    mockTargetModel as any,
+    mockPositionModel as unknown as Model<PositionDocument>,
+    mockTargetModel as unknown as Model<TargetDocument>,
     mockEventsGateway,
     mockDiscordNotifier
   );
@@ -118,10 +121,10 @@ Deno.test("PositionsService - throttling bloque les exécutions automatiques tro
   };
 
   const service = new PositionsService(
-    mockPositionModel as any,
-    {} as any,
-    { broadcast: () => {} } as any,
-    {} as any
+    mockPositionModel as unknown as Model<PositionDocument>,
+    {} as unknown as Model<TargetDocument>,
+    { broadcast: () => {} } as unknown as EventsGateway,
+    {} as unknown as DiscordNotifierService
   );
 
   // Premier appel automatique -> exécuté
