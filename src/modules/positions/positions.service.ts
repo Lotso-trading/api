@@ -288,7 +288,7 @@ export class PositionsService {
       const newPos = new this.positionModel({
         positionId,
         conditionId: trade.conditionId,
-        assetAddress: trade.conditionId.toLowerCase(),
+        assetAddress: (trade.assetAddress || trade.conditionId).toLowerCase(),
         marketSlug: marketInfo?.marketSlug || "market",
         marketQuestion: marketInfo?.marketQuestion || "Polymarket Question",
         outcomeLabel: marketInfo?.outcomeLabel || "Yes",
