@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { RiskConfig, UpdateRiskConfigInput } from "@polymarket-copy/shared";
 import type { Model } from "mongoose";
@@ -6,14 +6,61 @@ import { type ConfigDocument, ConfigModel } from "../../database/schemas/config.
 import { EventsGateway } from "../gateway/events.gateway.ts";
 
 @Injectable()
-export class BotConfigService {
+export class BotConfigService implements OnModuleInit, OnModuleDestroy {
+  private lastHeartbeatTimestamp = 0;
+  private isExplicitlyShutdown = false;
+  private wasOnline = false;
+  private heartbeatCheckInterval: ReturnType<typeof setInterval> | null = null;
+
   constructor(
     @InjectModel(ConfigModel.name)
     private readonly configModel: Model<ConfigDocument>,
     private readonly eventsGateway: EventsGateway
   ) {}
 
-  async getConfig(): Promise<RiskConfig & { isBotRunning: boolean }> {
+  onModuleInit(): void {
+    this.heartbeatCheckInterval = setInterval(async () => {
+      const currentlyOnline = this.isBotOnline();
+      if (currentlyOnline !== this.wasOnline) {
+        this.wasOnline = currentlyOnline;
+        const cfg = await this.getConfig();
+        this.eventsGateway.broadcast("config:updated", cfg);
+      }
+    }, 10000);
+  }
+
+  onModuleDestroy(): void {
+    if (this.heartbeatCheckInterval) {
+      clearInterval(this.heartbeatCheckInterval);
+      this.heartbeatCheckInterval = null;
+    }
+  }
+
+  isBotOnline(): boolean {
+    if (this.isExplicitlyShutdown) return false;
+    return this.lastHeartbeatTimestamp > 0 && Date.now() - this.lastHeartbeatTimestamp < 30_000;
+  }
+
+  async recordHeartbeat(): Promise<void> {
+    this.lastHeartbeatTimestamp = Date.now();
+    this.isExplicitlyShutdown = false;
+    if (!this.wasOnline) {
+      this.wasOnline = true;
+      const cfg = await this.getConfig();
+      this.eventsGateway.broadcast("config:updated", cfg);
+    }
+  }
+
+  async recordShutdown(): Promise<void> {
+    this.isExplicitlyShutdown = true;
+    if (this.wasOnline) {
+      this.wasOnline = false;
+      const cfg = await this.getConfig();
+      this.eventsGateway.broadcast("config:updated", cfg);
+    }
+  }
+
+  async getConfig(): Promise<RiskConfig> {
     let doc = await this.configModel.findOne({ key: "singleton" }).lean().exec();
     if (!doc) {
       const created = new this.configModel({
@@ -50,10 +97,11 @@ export class BotConfigService {
       maxAllocatedCapitalUsdc: Number(doc.maxAllocatedCapitalUsdc ?? 0),
       profitReinvestmentPercent: Number(doc.profitReinvestmentPercent ?? 50.0),
       isBotRunning: Boolean(doc.isBotRunning),
+      isBotOnline: this.isBotOnline(),
     };
   }
 
-  async updateConfig(dto: UpdateRiskConfigInput): Promise<RiskConfig & { isBotRunning: boolean }> {
+  async updateConfig(dto: UpdateRiskConfigInput): Promise<RiskConfig> {
     await this.getConfig(); // Assure la création du singleton
     const updated = await this.configModel
       .findOneAndUpdate(
@@ -90,6 +138,9 @@ export class BotConfigService {
             ...(dto.profitReinvestmentPercent !== undefined && {
               profitReinvestmentPercent: dto.profitReinvestmentPercent,
             }),
+            ...(dto.isBotRunning !== undefined && {
+              isBotRunning: dto.isBotRunning,
+            }),
           },
         },
         { new: true }
@@ -97,7 +148,7 @@ export class BotConfigService {
       .lean()
       .exec();
 
-    const result = {
+    const result: RiskConfig = {
       balancePercentPerTrade: Number(updated?.balancePercentPerTrade),
       maxSlippagePercent: Number(updated?.maxSlippagePercent),
       maxCapPerTradeUsdc: Number(updated?.maxCapPerTradeUsdc),
@@ -111,6 +162,7 @@ export class BotConfigService {
       maxAllocatedCapitalUsdc: Number(updated?.maxAllocatedCapitalUsdc ?? 0),
       profitReinvestmentPercent: Number(updated?.profitReinvestmentPercent ?? 50.0),
       isBotRunning: Boolean(updated?.isBotRunning),
+      isBotOnline: this.isBotOnline(),
     };
 
     this.eventsGateway.broadcast("config:updated", result);

@@ -5,7 +5,7 @@ import type { HydratedDocument } from "mongoose";
 export type ConfigDocument = HydratedDocument<ConfigModel>;
 
 @Schema({ timestamps: true, collection: "configs" })
-export class ConfigModel implements RiskConfig {
+export class ConfigModel implements Omit<RiskConfig, "isBotOnline"> {
   @Prop({ required: true, default: "singleton", unique: true })
   key!: string;
 
