@@ -14,7 +14,7 @@ export class EventsGateway implements OnModuleInit, OnModuleDestroy {
       this.wss.on("connection", (socket: WebSocket) => {
         socket.send(JSON.stringify({ event: "connected", timestamp: Date.now() }));
       });
-    } catch (err) {
+    } catch (err: unknown) {
       console.warn(`[EventsGateway] Could not bind WebSocket port ${this.port}:`, err);
     }
   }
