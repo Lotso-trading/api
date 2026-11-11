@@ -105,13 +105,22 @@ export async function run(): Promise<void> {
 
   for (const pos of positions) {
     const invested = pos.totalInvestedUsdc || 0;
+    const isWin = pos.closeReason === "RESOLVED_WIN";
+    const nominalWinPayout = isWin ? Math.round((pos.totalShares || 0) * 100) / 100 : undefined;
     const payout =
-      pos.settledPayoutUsdc !== undefined
-        ? pos.settledPayoutUsdc
+      nominalWinPayout !== undefined
+        ? nominalWinPayout
+        : pos.settledPayoutUsdc !== undefined
+          ? pos.settledPayoutUsdc
+          : pos.realizedPnlUsdc !== undefined
+            ? Math.max(0, invested + pos.realizedPnlUsdc)
+            : 0;
+    const pnl =
+      nominalWinPayout !== undefined
+        ? nominalWinPayout - invested
         : pos.realizedPnlUsdc !== undefined
-          ? Math.max(0, invested + pos.realizedPnlUsdc)
-          : 0;
-    const pnl = pos.realizedPnlUsdc !== undefined ? pos.realizedPnlUsdc : payout - invested;
+          ? pos.realizedPnlUsdc
+          : payout - invested;
 
     totalInvestedUsdc += invested;
     totalPayoutUsdc += payout;

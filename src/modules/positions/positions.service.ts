@@ -142,18 +142,27 @@ export class PositionsService {
         if (data.closed === true && Array.isArray(data.tokens) && data.tokens.length > 0) {
           const winningToken = data.tokens.find((t) => t.winner === true);
           if (winningToken?.outcome) {
-            const isWin =
-              pos.outcomeLabel.trim().toLowerCase() === winningToken.outcome.trim().toLowerCase();
+            // Recharger le document frais depuis la base pour éviter toute donnée périmée
+            // suite au délai de latence de l'appel HTTP CLOB (race condition avec un achat concurrent)
+            const freshPos = await this.positionModel.findOne({
+              _id: pos._id,
+              status: { $ne: "CLOSED" },
+            });
 
-            const settledPayoutUsdc = isWin ? Number(pos.totalShares.toFixed(2)) : 0;
-            const realizedPnlUsdc = settledPayoutUsdc - pos.totalInvestedUsdc;
+            if (!freshPos) continue;
+
+            const isWin =
+              freshPos.outcomeLabel.trim().toLowerCase() === winningToken.outcome.trim().toLowerCase();
+
+            const settledPayoutUsdc = isWin ? Number(freshPos.totalShares.toFixed(2)) : 0;
+            const realizedPnlUsdc = Number((settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2));
             const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
             const now = Date.now();
 
             // Mise à jour conditionnelle atomique : garantit l'idempotence stricte
             const updatedDoc = await this.positionModel.findOneAndUpdate(
               {
-                _id: pos._id,
+                _id: freshPos._id,
                 status: { $ne: "CLOSED" },
               },
               {
@@ -273,13 +282,16 @@ export class PositionsService {
       endDate?: string;
     }
   ): Promise<OpenPosition> {
+    const targetAssetAddress = (trade.assetAddress || trade.conditionId).toLowerCase();
     const existing = await this.positionModel.findOne({
       conditionId: trade.conditionId,
+      assetAddress: targetAssetAddress,
+      status: { $ne: "CLOSED" },
     });
 
     let savedDoc: PositionDocument;
 
-    if (!existing || existing.status === "CLOSED") {
+    if (!existing) {
       const positionId = `pos_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       const resolvedEndDate =
         marketInfo?.endDate ||
@@ -333,10 +345,14 @@ export class PositionsService {
   }
 
   async recordSell(trade: ExecutedTrade): Promise<OpenPosition | null> {
-    const existing = await this.positionModel.findOne({
+    const query: Record<string, unknown> = {
       conditionId: trade.conditionId,
       status: { $ne: "CLOSED" },
-    });
+    };
+    if (trade.assetAddress) {
+      query.assetAddress = trade.assetAddress.toLowerCase();
+    }
+    const existing = await this.positionModel.findOne(query);
 
     if (!existing) return null;
 
