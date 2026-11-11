@@ -1,6 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
+import { type ConfigDocument, ConfigModel } from "../../database/schemas/config.schema.ts";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
 import { type TradeDocument, TradeModel } from "../../database/schemas/trade.schema.ts";
@@ -46,6 +47,8 @@ export class MetricsService {
     private readonly positionModel: Model<PositionDocument>,
     @InjectModel(TargetModel.name)
     private readonly targetModel: Model<TargetDocument>,
+    @InjectModel(ConfigModel.name)
+    private readonly configModel: Model<ConfigDocument>,
     private readonly eventsGateway: EventsGateway
   ) {}
 
@@ -56,8 +59,8 @@ export class MetricsService {
   }
 
   async getMetrics(): Promise<GlobalMetrics> {
-    const [tradeAgg, positionAgg, closedAgg, activeTargetsCount, rejectedCount] = await Promise.all(
-      [
+    const [tradeAgg, positionAgg, closedAgg, activeTargetsCount, rejectedCount, configDoc] =
+      await Promise.all([
         this.tradeModel.aggregate([
           { $match: { status: "FILLED" } },
           {
@@ -93,8 +96,8 @@ export class MetricsService {
         ]),
         this.targetModel.countDocuments({ enabled: true }).exec(),
         this.tradeModel.countDocuments({ status: "REJECTED" }).exec(),
-      ]
-    );
+        this.configModel.findOne({ key: "singleton" }).lean().exec(),
+      ]);
 
     const tradeStats = tradeAgg[0] || { totalVolume: 0, totalTrades: 0 };
     const positionStats = positionAgg[0] || {
@@ -109,7 +112,9 @@ export class MetricsService {
       count: 0,
     };
 
-    const initialCapitalUsdc = Number(Deno.env.get("SIMULATED_BALANCE_USDC")) || 100.0;
+    const initialCapitalUsdc = Number(
+      configDoc?.simulatedBalanceUsdc ?? Number(Deno.env.get("SIMULATED_BALANCE_USDC")) ?? 1000.0
+    );
     const totalInvestedUsdc = Number(positionStats.totalInvested || 0);
     const realizedPnlUsdc = Number(closedStats.totalRealizedPnl || 0);
     const availableCashUsdc = Math.max(0, initialCapitalUsdc - totalInvestedUsdc + realizedPnlUsdc);
@@ -135,19 +140,20 @@ export class MetricsService {
   }
 
   async getPerformanceHistory(): Promise<PerformancePoint[]> {
-    const targets = await this.targetModel.find({}).lean().exec();
+    const [targets, trades, configDoc] = await Promise.all([
+      this.targetModel.find({}).lean().exec(),
+      this.tradeModel.find({ status: "FILLED" }).sort({ executedAt: 1 }).lean().exec(),
+      this.configModel.findOne({ key: "singleton" }).lean().exec(),
+    ]);
+
     const targetMap = new Map<string, string>();
     for (const t of targets) {
       targetMap.set(t.address.toLowerCase(), t.alias);
     }
 
-    const trades = await this.tradeModel
-      .find({ status: "FILLED" })
-      .sort({ executedAt: 1 })
-      .lean()
-      .exec();
-
-    const initialCapital = Number(Deno.env.get("SIMULATED_BALANCE_USDC")) || 100.0;
+    const initialCapital = Number(
+      configDoc?.simulatedBalanceUsdc ?? Number(Deno.env.get("SIMULATED_BALANCE_USDC")) ?? 1000.0
+    );
     let runningCash = initialCapital;
     let runningCumulativePnl = 0.0;
     let runningWhaleVolume = 0.0;

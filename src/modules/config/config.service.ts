@@ -1,9 +1,10 @@
-import { Injectable } from "@nestjs/common";
+import { BadRequestException, Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { RiskConfig, UpdateRiskConfigInput } from "@polymarket-copy/shared";
 import type { Model } from "mongoose";
 import { type ConfigDocument, ConfigModel } from "../../database/schemas/config.schema.ts";
 import { EventsGateway } from "../gateway/events.gateway.ts";
+import { MetricsService } from "../metrics/metrics.service.ts";
 
 @Injectable()
 export class BotConfigService {
@@ -12,7 +13,8 @@ export class BotConfigService {
   constructor(
     @InjectModel(ConfigModel.name)
     private readonly configModel: Model<ConfigDocument>,
-    private readonly eventsGateway: EventsGateway
+    private readonly eventsGateway: EventsGateway,
+    private readonly metricsService: MetricsService
   ) {
     this.eventsGateway.onBotPresenceChange(async (isOnline: boolean) => {
       this.isBotOnlineState = isOnline;
@@ -56,6 +58,7 @@ export class BotConfigService {
         maxPrice: 0.9,
         copySellOrders: true,
         dryRun: true,
+        simulatedBalanceUsdc: 1000.0,
         maxAllocatedCapitalUsdc: 0,
         profitReinvestmentPercent: 50.0,
         isBotRunning: true,
@@ -75,6 +78,7 @@ export class BotConfigService {
       maxPrice: Number(doc.maxPrice),
       copySellOrders: Boolean(doc.copySellOrders),
       dryRun: Boolean(doc.dryRun),
+      simulatedBalanceUsdc: Number(doc.simulatedBalanceUsdc ?? 1000.0),
       maxAllocatedCapitalUsdc: Number(doc.maxAllocatedCapitalUsdc ?? 0),
       profitReinvestmentPercent: Number(doc.profitReinvestmentPercent ?? 50.0),
       isBotRunning: Boolean(doc.isBotRunning),
@@ -113,6 +117,9 @@ export class BotConfigService {
               copySellOrders: dto.copySellOrders,
             }),
             ...(dto.dryRun !== undefined && { dryRun: dto.dryRun }),
+            ...(dto.simulatedBalanceUsdc !== undefined && {
+              simulatedBalanceUsdc: dto.simulatedBalanceUsdc,
+            }),
             ...(dto.maxAllocatedCapitalUsdc !== undefined && {
               maxAllocatedCapitalUsdc: dto.maxAllocatedCapitalUsdc,
             }),
@@ -140,6 +147,7 @@ export class BotConfigService {
       maxPrice: Number(updated?.maxPrice),
       copySellOrders: Boolean(updated?.copySellOrders),
       dryRun: Boolean(updated?.dryRun),
+      simulatedBalanceUsdc: Number(updated?.simulatedBalanceUsdc ?? 1000.0),
       maxAllocatedCapitalUsdc: Number(updated?.maxAllocatedCapitalUsdc ?? 0),
       profitReinvestmentPercent: Number(updated?.profitReinvestmentPercent ?? 50.0),
       isBotRunning: Boolean(updated?.isBotRunning),
@@ -148,5 +156,41 @@ export class BotConfigService {
 
     this.eventsGateway.broadcast("config:updated", result);
     return result;
+  }
+
+  async adjustVirtualWallet(
+    action: "DEPOSIT" | "WITHDRAW",
+    amountUsdc: number
+  ): Promise<{ success: boolean; simulatedBalanceUsdc: number; availableCashUsdc: number }> {
+    if (amountUsdc <= 0) {
+      throw new BadRequestException("Le montant doit être strictement supérieur à zéro.");
+    }
+
+    const currentConfig = await this.getConfig();
+    const metrics = await this.metricsService.getMetrics();
+
+    if (action === "WITHDRAW") {
+      const maxAllowedWithdrawal = metrics.availableCashUsdc;
+      if (amountUsdc > maxAllowedWithdrawal) {
+        throw new BadRequestException(
+          `Retrait refusé : solde libre insuffisant (${amountUsdc.toFixed(2)} $ demandé > ${maxAllowedWithdrawal.toFixed(2)} $ disponible). Des fonds sont actuellement engagés dans des marchés.`
+        );
+      }
+    }
+
+    const currentSimulated = currentConfig.simulatedBalanceUsdc ?? 1000.0;
+    const newSimulatedBalance =
+      action === "DEPOSIT"
+        ? Math.round((currentSimulated + amountUsdc) * 100) / 100
+        : Math.round(Math.max(0, currentSimulated - amountUsdc) * 100) / 100;
+
+    await this.updateConfig({ simulatedBalanceUsdc: newSimulatedBalance });
+    const updatedMetrics = await this.metricsService.broadcastMetrics();
+
+    return {
+      success: true,
+      simulatedBalanceUsdc: newSimulatedBalance,
+      availableCashUsdc: updatedMetrics.availableCashUsdc,
+    };
   }
 }

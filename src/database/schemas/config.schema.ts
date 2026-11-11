@@ -39,6 +39,9 @@ export class ConfigModel implements Omit<RiskConfig, "isBotOnline"> {
   @Prop({ required: true, default: true })
   dryRun!: boolean;
 
+  @Prop({ required: true, default: 1000.0 })
+  simulatedBalanceUsdc!: number;
+
   @Prop({ required: true, default: 0 })
   maxAllocatedCapitalUsdc!: number;
 

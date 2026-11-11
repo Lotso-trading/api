@@ -1,6 +1,10 @@
 import { assertEquals, assertThrows } from "jsr:@std/assert";
 import { BadRequestException, type ExecutionContext } from "@nestjs/common";
-import { AddTargetInputSchema } from "@polymarket-copy/shared";
+import {
+  AddTargetInputSchema,
+  WalletDepositInputSchema,
+  WalletWithdrawInputSchema,
+} from "@polymarket-copy/shared";
 import { of } from "rxjs";
 import { TransformInterceptor } from "../src/common/interceptors/transform.interceptor.ts";
 import { ZodValidationPipe } from "../src/common/pipes/zod-validation.pipe.ts";
@@ -45,4 +49,17 @@ Deno.test("TransformInterceptor - encapsule la réponse avec success: true", asy
       resolve();
     });
   });
+});
+
+Deno.test("ZodValidationPipe - valide les DTOs de portefeuille virtuel", () => {
+  const depositPipe = new ZodValidationPipe(WalletDepositInputSchema);
+  const deposit = depositPipe.transform({ amountUsdc: 250 });
+  assertEquals(deposit.amountUsdc, 250);
+
+  const withdrawPipe = new ZodValidationPipe(WalletWithdrawInputSchema);
+  const withdraw = withdrawPipe.transform({ amountUsdc: 50.5 });
+  assertEquals(withdraw.amountUsdc, 50.5);
+
+  assertThrows(() => depositPipe.transform({ amountUsdc: -10 }), BadRequestException);
+  assertThrows(() => withdrawPipe.transform({ amountUsdc: 0 }), BadRequestException);
 });
