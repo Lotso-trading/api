@@ -137,3 +137,82 @@ Deno.test("PositionsService - throttling bloque les exécutions automatiques tro
   assertEquals(second, 0);
   assertEquals(dbFindCount, 1, "Le throttling doit empêcher l'exécution");
 });
+
+Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pagination et calcul des totaux", async () => {
+  const mockAggregationResult = [
+    {
+      items: [
+        {
+          _id: "pos_1",
+          conditionId: "0xcond1",
+          assetAddress: "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
+          marketSlug: "slug-1",
+          marketQuestion: "Question 1?",
+          outcomeLabel: "Yes",
+          status: "CLOSED",
+          closeReason: "RESOLVED_WIN",
+          totalShares: 100,
+          avgEntryPrice: 0.5,
+          totalInvestedUsdc: 50,
+          settledPayoutUsdc: 100,
+          realizedPnlUsdc: 50,
+          currentMarketPrice: 1,
+          currentMarketValueUsdc: 100,
+          unrealizedPnlUsdc: 0,
+          unrealizedPnlPercent: 0,
+          targetAddress: "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
+          openedAt: 1730000000000,
+          updatedAt: 1730001000000,
+          closedAt: 1730001000000,
+        },
+      ],
+      stats: [
+        {
+          _id: null,
+          count: 55,
+          totalInvested: 2750,
+          totalPayout: 4000,
+          netPnl: 1250,
+          totalShares: 4000,
+          winCount: 40,
+          lossCount: 15,
+          totalGains: 1500,
+          totalLosses: 250,
+        },
+      ],
+    },
+  ];
+
+  const mockPositionModel = {
+    aggregate: (pipeline: unknown[]) => {
+      assertEquals(Array.isArray(pipeline), true);
+      return Promise.resolve(mockAggregationResult);
+    },
+  };
+
+  const service = new PositionsService(
+    mockPositionModel as unknown as Model<PositionDocument>,
+    {} as unknown as Model<TargetDocument>,
+    { broadcast: () => {} } as unknown as EventsGateway,
+    {} as unknown as DiscordNotifierService
+  );
+
+  const paginated = await service.findClosedPaginated({
+    page: 2,
+    limit: 25,
+    status: "WIN",
+  });
+
+  assertEquals(paginated.page, 2);
+  assertEquals(paginated.limit, 25);
+  assertEquals(paginated.total, 55);
+  assertEquals(paginated.totalPages, 3);
+  assertEquals(paginated.items.length, 1);
+  assertEquals(paginated.items[0]?.id, "pos_1");
+  assertEquals(paginated.totals.count, 55);
+  assertEquals(paginated.totals.winCount, 40);
+  assertEquals(paginated.totals.lossCount, 15);
+  assertEquals(paginated.totals.netPnl, 1250);
+  assertEquals(paginated.totals.totalInvested, 2750);
+  assertEquals(paginated.totals.totalPayout, 4000);
+});

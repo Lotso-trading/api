@@ -54,6 +54,7 @@ export class BotConfigService {
         maxExposurePerMarketUsdc: 150.0,
         maxExposurePerTargetUsdc: 300.0,
         minCashReserveUsdc: 5.0,
+        minTradeSizeUsdc: 2.0,
         minPrice: 0.05,
         maxPrice: 0.9,
         copySellOrders: true,
@@ -74,6 +75,7 @@ export class BotConfigService {
       maxExposurePerMarketUsdc: Number(doc.maxExposurePerMarketUsdc ?? 150.0),
       maxExposurePerTargetUsdc: Number(doc.maxExposurePerTargetUsdc ?? 300.0),
       minCashReserveUsdc: Number(doc.minCashReserveUsdc ?? 5.0),
+      minTradeSizeUsdc: Number(doc.minTradeSizeUsdc ?? 2.0),
       minPrice: Number(doc.minPrice),
       maxPrice: Number(doc.maxPrice),
       copySellOrders: Boolean(doc.copySellOrders),
@@ -111,6 +113,9 @@ export class BotConfigService {
             ...(dto.minCashReserveUsdc !== undefined && {
               minCashReserveUsdc: dto.minCashReserveUsdc,
             }),
+            ...(dto.minTradeSizeUsdc !== undefined && {
+              minTradeSizeUsdc: dto.minTradeSizeUsdc,
+            }),
             ...(dto.minPrice !== undefined && { minPrice: dto.minPrice }),
             ...(dto.maxPrice !== undefined && { maxPrice: dto.maxPrice }),
             ...(dto.copySellOrders !== undefined && {
@@ -143,6 +148,7 @@ export class BotConfigService {
       maxExposurePerMarketUsdc: Number(updated?.maxExposurePerMarketUsdc ?? 150.0),
       maxExposurePerTargetUsdc: Number(updated?.maxExposurePerTargetUsdc ?? 300.0),
       minCashReserveUsdc: Number(updated?.minCashReserveUsdc ?? 5.0),
+      minTradeSizeUsdc: Number(updated?.minTradeSizeUsdc ?? 2.0),
       minPrice: Number(updated?.minPrice),
       maxPrice: Number(updated?.maxPrice),
       copySellOrders: Boolean(updated?.copySellOrders),

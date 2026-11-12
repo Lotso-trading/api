@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
-import type { ExecutedTrade, OpenPosition } from "@polymarket-copy/shared";
+import type { ClosedPositionsQuery, ExecutedTrade, OpenPosition } from "@polymarket-copy/shared";
 import type { Model } from "mongoose";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
@@ -252,6 +252,140 @@ export class PositionsService {
       .exec();
 
     return docs.map((doc) => this.mapToPosition(doc));
+  }
+
+  async findClosedPaginated(query: ClosedPositionsQuery): Promise<{
+    items: OpenPosition[];
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+    totals: {
+      count: number;
+      totalInvested: number;
+      totalPayout: number;
+      totalGains: number;
+      totalLosses: number;
+      netPnl: number;
+      totalShares: number;
+      avgEntryPrice: number;
+      winCount: number;
+      lossCount: number;
+      winRate: number;
+      roiPercent: number;
+    };
+  }> {
+    const page = Math.max(1, query.page ? Number(query.page) : 1);
+    const limit = Math.min(100, Math.max(1, query.limit ? Number(query.limit) : 25));
+    const skip = (page - 1) * limit;
+
+    const matchQuery: Record<string, unknown> = { status: "CLOSED" };
+    if (query.status === "WIN") {
+      matchQuery.closeReason = "RESOLVED_WIN";
+    } else if (query.status === "LOSS") {
+      matchQuery.closeReason = "RESOLVED_LOSS";
+    }
+
+    const since = query.since ? Number(query.since) : undefined;
+    if (since && since > 0) {
+      matchQuery.$or = [
+        { closedAt: { $gte: since } },
+        { updatedAt: { $gte: since } },
+      ];
+    }
+
+    const [aggregationResult] = await this.positionModel.aggregate([
+      { $match: matchQuery },
+      {
+        $facet: {
+          items: [
+            { $sort: { closedAt: -1, updatedAt: -1 } },
+            { $skip: skip },
+            { $limit: limit },
+          ],
+          stats: [
+            {
+              $group: {
+                _id: null,
+                totalInvested: { $sum: "$totalInvestedUsdc" },
+                totalPayout: { $sum: "$settledPayoutUsdc" },
+                netPnl: { $sum: "$realizedPnlUsdc" },
+                totalShares: { $sum: "$totalShares" },
+                winCount: {
+                  $sum: {
+                    $cond: [{ $eq: ["$closeReason", "RESOLVED_WIN"] }, 1, 0],
+                  },
+                },
+                lossCount: {
+                  $sum: {
+                    $cond: [{ $eq: ["$closeReason", "RESOLVED_LOSS"] }, 1, 0],
+                  },
+                },
+                totalGains: {
+                  $sum: {
+                    $cond: [{ $gt: ["$realizedPnlUsdc", 0] }, "$realizedPnlUsdc", 0],
+                  },
+                },
+                totalLosses: {
+                  $sum: {
+                    $cond: [{ $lt: ["$realizedPnlUsdc", 0] }, { $abs: "$realizedPnlUsdc" }, 0],
+                  },
+                },
+                count: { $sum: 1 },
+              },
+            },
+          ],
+        },
+      },
+    ]);
+
+    const rawItems = (aggregationResult?.items || []) as PositionDocument[];
+    const statsDoc = aggregationResult?.stats?.[0] || {
+      totalInvested: 0,
+      totalPayout: 0,
+      netPnl: 0,
+      totalShares: 0,
+      winCount: 0,
+      lossCount: 0,
+      totalGains: 0,
+      totalLosses: 0,
+      count: 0,
+    };
+
+    const count = Number(statsDoc.count || 0);
+    const totalInvested = Number(statsDoc.totalInvested || 0);
+    const totalPayout = Number(statsDoc.totalPayout || 0);
+    const netPnl = Number(statsDoc.netPnl || 0);
+    const totalShares = Number(statsDoc.totalShares || 0);
+    const winCount = Number(statsDoc.winCount || 0);
+    const lossCount = Number(statsDoc.lossCount || 0);
+    const totalGains = Number(statsDoc.totalGains || 0);
+    const totalLosses = Number(statsDoc.totalLosses || 0);
+    const avgEntryPrice = totalShares > 0 ? totalInvested / totalShares : 0;
+    const winRate = count > 0 ? (winCount / count) * 100 : 0;
+    const roiPercent = totalInvested > 0 ? (netPnl / totalInvested) * 100 : 0;
+
+    return {
+      items: rawItems.map((doc) => this.mapToPosition(doc)),
+      total: count,
+      page,
+      limit,
+      totalPages: Math.ceil(count / limit) || 1,
+      totals: {
+        count,
+        totalInvested,
+        totalPayout,
+        totalGains,
+        totalLosses,
+        netPnl,
+        totalShares,
+        avgEntryPrice,
+        winCount,
+        lossCount,
+        winRate,
+        roiPercent,
+      },
+    };
   }
 
   async findById(id: string): Promise<OpenPosition> {

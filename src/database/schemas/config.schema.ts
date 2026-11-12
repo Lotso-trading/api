@@ -27,6 +27,9 @@ export class ConfigModel implements Omit<RiskConfig, "isBotOnline"> {
   @Prop({ required: true, default: 5.0 })
   minCashReserveUsdc!: number;
 
+  @Prop({ required: false, default: 2.0 })
+  minTradeSizeUsdc!: number;
+
   @Prop({ required: true, default: 0.05 })
   minPrice!: number;
 
