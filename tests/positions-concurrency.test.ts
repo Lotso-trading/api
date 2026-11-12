@@ -326,3 +326,131 @@ Deno.test("PositionsService - recordPositionRedeemed enregistre la tx et diffuse
   assertEquals(broadcastEvent, "position:redeemed");
   assertEquals((broadcastPayload as { txHash: string }).txHash, "0xreal_tx_hash_12345");
 });
+
+Deno.test("PositionsService - resolveMarketEndDate résout la date via Gamma API fallback", async () => {
+  const originalFetch = globalThis.fetch;
+  const mockConditionId = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+  let fetchCount = 0;
+
+  globalThis.fetch = ((url: string | URL | Request) => {
+    fetchCount++;
+    const urlStr = String(url);
+    // 1. CLOB échoue
+    if (urlStr.includes("clob.polymarket.com")) {
+      return Promise.resolve(new Response("Not Found", { status: 404 }));
+    }
+    // 2. Gamma réussit
+    if (urlStr.includes("gamma-api.polymarket.com/markets?condition_id=")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([
+            {
+              endDate: "2026-11-20T18:00:00Z",
+              endDateIso: "2026-11-20T18:00:00Z",
+            },
+          ]),
+          { status: 200 }
+        )
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  try {
+    const service = new PositionsService(
+      {} as unknown as Model<PositionDocument>,
+      {} as unknown as Model<TargetDocument>,
+      { broadcast: () => {} } as unknown as EventsGateway,
+      {} as unknown as DiscordNotifierService
+    );
+
+    const resolved = await service.resolveMarketEndDate(mockConditionId, "test-market");
+    assertEquals(resolved, "2026-11-20T18:00:00Z");
+
+    // Second appel -> doit provenir du cache (fetchCount ne doit pas augmenter)
+    const cached = await service.resolveMarketEndDate(mockConditionId, "test-market");
+    assertEquals(cached, "2026-11-20T18:00:00Z");
+    assertEquals(fetchCount, 2); // 1 CLOB + 1 Gamma = 2 fetches au 1er appel, 0 au 2e
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API quand CLOB échoue", async () => {
+  const originalFetch = globalThis.fetch;
+  const mockConditionId = "0x9876543210abcdef9876543210abcdef9876543210abcdef9876543210abcdef";
+  let settledCalled = false;
+
+  const mockPos = {
+    _id: "pos_gamma_test",
+    conditionId: mockConditionId,
+    assetAddress: "0x1111111111111111111111111111111111111111",
+    marketSlug: "slug-worldcup",
+    marketQuestion: "France vs Brazil?",
+    outcomeLabel: "France",
+    status: "OPEN",
+    totalShares: 100,
+    avgEntryPrice: 0.5,
+    totalInvestedUsdc: 50,
+    currentMarketPrice: 0.5,
+    currentMarketValueUsdc: 50,
+  };
+
+  const mockPositionModel = {
+    find: () => ({
+      exec: () => Promise.resolve([mockPos]),
+    }),
+    findOne: () => Promise.resolve(mockPos),
+    findOneAndUpdate: (_filter: unknown, update: { $set: { status: string; closeReason: string } }) => {
+      settledCalled = true;
+      assertEquals(update.$set.status, "CLOSED");
+      assertEquals(update.$set.closeReason, "RESOLVED_WIN");
+      return Promise.resolve({
+        ...mockPos,
+        ...update.$set,
+        toObject: () => ({ ...mockPos, ...update.$set }),
+      });
+    },
+    updateOne: () => Promise.resolve({}),
+  };
+
+  globalThis.fetch = ((url: string | URL | Request) => {
+    const urlStr = String(url);
+    // CLOB échoue ou ne renvoie pas encore de winner
+    if (urlStr.includes("clob.polymarket.com")) {
+      return Promise.resolve(new Response(JSON.stringify({ closed: true, tokens: [] }), { status: 200 }));
+    }
+    // Gamma renvoie le résultat avec outcomePrices
+    if (urlStr.includes("gamma-api.polymarket.com")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify([
+            {
+              closed: true,
+              endDate: "2026-11-15T20:00:00Z",
+              outcomes: JSON.stringify(["France", "Brazil"]),
+              outcomePrices: JSON.stringify(["1", "0"]),
+            },
+          ]),
+          { status: 200 }
+        )
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  try {
+    const service = new PositionsService(
+      mockPositionModel as unknown as Model<PositionDocument>,
+      { findOne: () => ({ lean: () => ({ exec: () => Promise.resolve(null) }) }) } as unknown as Model<TargetDocument>,
+      { broadcast: () => {} } as unknown as EventsGateway,
+      { sendClosedPositionAlert: () => Promise.resolve() } as unknown as DiscordNotifierService
+    );
+
+    const count = await service.settleResolvedPositions(true);
+    assertEquals(count, 1);
+    assertEquals(settledCalled, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

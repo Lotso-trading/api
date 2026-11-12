@@ -14,7 +14,7 @@ import { DiscordNotifierService } from "../notifications/discord-notifier.servic
 
 @Injectable()
 export class PositionsService implements OnModuleInit, OnModuleDestroy {
-  private readonly marketEndDateCache = new Map<string, string>();
+  private readonly marketEndDateCache = new Map<string, { date: string; timestamp: number }>();
   private settlePromise: Promise<number> | null = null;
   private lastAutoSettleTimestamp = 0;
   private readonly autoSettleThrottleMs = 30_000; // Throttling 30s entre deux vérifications automatiques
@@ -36,12 +36,57 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         console.warn("[PositionsService] Erreur lors de la vérification de settlement automatique:", err);
       });
     }, 60_000);
+
+    // Lancement en tâche de fond de la rétro-résolution des dates d'échéance manquantes
+    this.backfillMissingEndDates().catch((err: unknown) => {
+      console.warn("[PositionsService] Erreur backfill dates:", err);
+    });
   }
 
   onModuleDestroy(): void {
     if (this.autoSettleIntervalId !== null) {
       clearInterval(this.autoSettleIntervalId);
       this.autoSettleIntervalId = null;
+    }
+  }
+
+  private async backfillMissingEndDates(): Promise<void> {
+    try {
+      const positionsWithoutDate = await this.positionModel
+        .find({
+          $or: [{ endDate: { $exists: false } }, { endDate: "" }, { endDate: null }],
+          conditionId: { $ne: "0x" },
+        })
+        .limit(200)
+        .exec();
+
+      if (positionsWithoutDate.length === 0) return;
+
+      console.log(
+        `[PositionsService] 🔄 Début de la rétro-résolution des dates pour ${positionsWithoutDate.length} position(s)...`
+      );
+
+      let resolvedCount = 0;
+      for (const pos of positionsWithoutDate) {
+        const resolved = await this.resolveMarketEndDate(
+          pos.conditionId,
+          pos.marketSlug,
+          pos.assetAddress
+        );
+        if (resolved) {
+          await this.positionModel.updateOne(
+            { _id: pos._id },
+            { $set: { endDate: resolved } }
+          );
+          resolvedCount++;
+        }
+      }
+
+      console.log(
+        `[PositionsService] ✅ Rétro-résolution terminée : ${resolvedCount}/${positionsWithoutDate.length} date(s) mise(s) à jour en base.`
+      );
+    } catch (err: unknown) {
+      console.warn("[PositionsService] Erreur lors de la rétro-résolution des dates:", err);
     }
   }
 
@@ -60,56 +105,162 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
 
   async resolveMarketEndDate(
     conditionId: string,
-    marketSlug?: string
+    marketSlug?: string,
+    assetAddress?: string
   ): Promise<string | undefined> {
     if (!conditionId || conditionId === "0x") return undefined;
+
     const cached = this.marketEndDateCache.get(conditionId);
-    if (cached !== undefined) {
-      return cached || undefined;
+    if (cached) {
+      // Date trouvée : mise en cache permanente
+      if (cached.date) {
+        return cached.date;
+      }
+      // Échec temporaire : ne ré-interroger qu'après 5 minutes (TTL 300s)
+      if (Date.now() - cached.timestamp < 300_000) {
+        return undefined;
+      }
     }
 
+    const isHexConditionId = conditionId.startsWith("0x") && conditionId.length >= 64;
+    const isTokenIdDecimal = !isHexConditionId && /^\d+$/.test(conditionId);
+
+    // 1. Appel CLOB API
     try {
-      const res = await fetch(`https://clob.polymarket.com/markets/${conditionId}`, {
-        signal: AbortSignal.timeout(2500),
+      const clobUrl = isTokenIdDecimal
+        ? `https://clob.polymarket.com/markets?token_id=${conditionId}`
+        : `https://clob.polymarket.com/markets/${conditionId}`;
+
+      const res = await fetch(clobUrl, {
+        signal: AbortSignal.timeout(5000),
       });
+
       if (res.ok) {
-        const data = (await res.json()) as {
+        const json = await res.json();
+        const data = (Array.isArray(json?.data) ? json.data[0] : json?.data || json) as {
           end_date_iso?: string;
           game_start_time?: string;
+          endDate?: string;
         };
-        const resolved = data.end_date_iso || data.game_start_time;
+        const resolved = data?.end_date_iso || data?.game_start_time || data?.endDate;
         if (resolved) {
-          this.marketEndDateCache.set(conditionId, resolved);
+          this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
           return resolved;
         }
       }
     } catch (_err: unknown) {
-      // Fallback vers Gamma
+      // Poursuite vers Gamma
     }
 
-    if (marketSlug && marketSlug !== "market" && marketSlug !== "polygon-onchain") {
+    // 2. Appel Gamma API par condition_id
+    if (isHexConditionId) {
       try {
         const res = await fetch(
-          `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(marketSlug)}`,
-          { signal: AbortSignal.timeout(2500) }
+          `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`,
+          { signal: AbortSignal.timeout(5000) }
         );
         if (res.ok) {
           const list = (await res.json()) as Array<{
             endDate?: string;
             endDateIso?: string;
+            game_start_time?: string;
           }>;
-          const resolved = list[0]?.endDate || list[0]?.endDateIso;
+          const resolved = list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
           if (resolved) {
-            this.marketEndDateCache.set(conditionId, resolved);
+            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
             return resolved;
           }
         }
       } catch (_err: unknown) {
-        // Ignorer les erreurs réseau
+        // Poursuite vers Token ID / Slug
       }
     }
 
-    this.marketEndDateCache.set(conditionId, "");
+    // 3. Appel Gamma API par Token ID (si conditionId ou assetAddress est un token ID décimal)
+    const effectiveTokenId = isTokenIdDecimal
+      ? conditionId
+      : assetAddress && /^\d+$/.test(assetAddress)
+        ? assetAddress
+        : null;
+
+    if (effectiveTokenId) {
+      try {
+        const res = await fetch(
+          `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`,
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (res.ok) {
+          const list = (await res.json()) as Array<{
+            endDate?: string;
+            endDateIso?: string;
+            game_start_time?: string;
+          }>;
+          const resolved = list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
+          if (resolved) {
+            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
+            return resolved;
+          }
+        }
+      } catch (_err: unknown) {
+        // Poursuite vers Slug
+      }
+    }
+
+    // 4. Appel Gamma API par slug (Events puis Markets)
+    if (
+      marketSlug &&
+      marketSlug !== "market" &&
+      marketSlug !== "polymarket-market" &&
+      marketSlug !== "polygon-onchain"
+    ) {
+      // 4.1 Test sur /events?slug= (très fréquent pour sports et tournois)
+      try {
+        const eventRes = await fetch(
+          `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(marketSlug)}`,
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (eventRes.ok) {
+          const eventList = (await eventRes.json()) as Array<{
+            endDate?: string;
+            endDateIso?: string;
+            markets?: Array<{ endDate?: string; endDateIso?: string }>;
+          }>;
+          const ev = eventList[0];
+          const resolved =
+            ev?.endDate || ev?.endDateIso || ev?.markets?.[0]?.endDate || ev?.markets?.[0]?.endDateIso;
+          if (resolved) {
+            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
+            return resolved;
+          }
+        }
+      } catch (_err: unknown) {
+        // Ignoré
+      }
+
+      // 4.2 Test sur /markets?slug=
+      try {
+        const marketRes = await fetch(
+          `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(marketSlug)}`,
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (marketRes.ok) {
+          const marketList = (await marketRes.json()) as Array<{
+            endDate?: string;
+            endDateIso?: string;
+          }>;
+          const resolved = marketList[0]?.endDate || marketList[0]?.endDateIso;
+          if (resolved) {
+            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
+            return resolved;
+          }
+        }
+      } catch (_err: unknown) {
+        // Ignoré
+      }
+    }
+
+    // Cache négatif temporaire (5 min) pour éviter le spam réseau sans bloquer ad vitam
+    this.marketEndDateCache.set(conditionId, { date: "", timestamp: Date.now() });
     return undefined;
   }
 
@@ -146,88 +297,177 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     for (const pos of openPositions) {
       if (!pos.conditionId || pos.conditionId === "0x") continue;
 
+      let isClosed = false;
+      let winningOutcome: string | null = null;
+      let resolvedMarketDate: string | undefined = pos.endDate;
+
+      const isHexConditionId = pos.conditionId.startsWith("0x") && pos.conditionId.length >= 64;
+      const isTokenIdDecimal = !isHexConditionId && /^\d+$/.test(pos.conditionId);
+
+      // 1. Interrogation CLOB API
       try {
-        const res = await fetch(`https://clob.polymarket.com/markets/${pos.conditionId}`, {
-          signal: AbortSignal.timeout(3000),
-        });
+        const clobUrl = isTokenIdDecimal
+          ? `https://clob.polymarket.com/markets?token_id=${pos.conditionId}`
+          : `https://clob.polymarket.com/markets/${pos.conditionId}`;
 
-        if (!res.ok) continue;
-
-        const data = (await res.json()) as {
-          closed?: boolean;
-          tokens?: Array<{
-            outcome?: string;
-            winner?: boolean;
-          }>;
-        };
-
-        if (data.closed === true && Array.isArray(data.tokens) && data.tokens.length > 0) {
-          const winningToken = data.tokens.find((t) => t.winner === true);
-          if (winningToken?.outcome) {
-            // Recharger le document frais depuis la base pour éviter toute donnée périmée
-            // suite au délai de latence de l'appel HTTP CLOB (race condition avec un achat concurrent)
-            const freshPos = await this.positionModel.findOne({
-              _id: pos._id,
-              status: { $ne: "CLOSED" },
-            });
-
-            if (!freshPos) continue;
-
-            const isWin =
-              freshPos.outcomeLabel.trim().toLowerCase() ===
-              winningToken.outcome.trim().toLowerCase();
-
-            const settledPayoutUsdc = isWin ? Number(freshPos.totalShares.toFixed(2)) : 0;
-            const realizedPnlUsdc = Number(
-              (settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2)
-            );
-            const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
-            const now = Date.now();
-
-            // Mise à jour conditionnelle atomique : garantit l'idempotence stricte
-            const updatedDoc = await this.positionModel.findOneAndUpdate(
-              {
-                _id: freshPos._id,
-                status: { $ne: "CLOSED" },
-              },
-              {
-                $set: {
-                  status: "CLOSED",
-                  closeReason,
-                  settledPayoutUsdc,
-                  realizedPnlUsdc,
-                  currentMarketPrice: isWin ? 1.0 : 0.0,
-                  currentMarketValueUsdc: settledPayoutUsdc,
-                  closedAt: now,
-                  updatedAt: now,
-                },
-              },
-              { new: true }
-            );
-
-            // Si null, un autre thread ou une exécution concurrente a déjà clôturé la position
-            if (!updatedDoc) {
-              continue;
+        const res = await fetch(clobUrl, { signal: AbortSignal.timeout(4000) });
+        if (res.ok) {
+          const json = await res.json();
+          const data = (Array.isArray(json?.data) ? json.data[0] : json?.data || json) as {
+            closed?: boolean;
+            end_date_iso?: string;
+            game_start_time?: string;
+            tokens?: Array<{ outcome?: string; winner?: boolean }>;
+          };
+          if (!resolvedMarketDate) {
+            resolvedMarketDate = data?.end_date_iso || data?.game_start_time;
+          }
+          if (data?.closed === true && Array.isArray(data?.tokens) && data.tokens.length > 0) {
+            const winToken = data.tokens.find((t) => t.winner === true);
+            if (winToken?.outcome) {
+              isClosed = true;
+              winningOutcome = winToken.outcome;
             }
-
-            settledCount++;
-
-            this.eventsGateway.broadcast("position:closed", {
-              conditionId: updatedDoc.conditionId,
-              positionId: updatedDoc.positionId,
-              closeReason,
-              settledPayoutUsdc,
-              realizedPnlUsdc,
-            });
-
-            // Notification Discord enrichie (une seule fois garantie)
-            const mapped = this.mapToPosition(updatedDoc.toObject());
-            const alias = await this.getTargetAlias(updatedDoc.targetAddress);
-            await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
           }
         }
       } catch (_err: unknown) {
-        // Ignorer les timeouts ponctuels
+        // Fallback vers Gamma
+      }
+
+      // 2. Fallback Gamma API si non résolu via CLOB
+      if (!winningOutcome) {
+        try {
+          const effectiveTokenId = isTokenIdDecimal
+            ? pos.conditionId
+            : pos.assetAddress && /^\d+$/.test(pos.assetAddress)
+              ? pos.assetAddress
+              : null;
+
+          const gammaUrl = isHexConditionId
+            ? `https://gamma-api.polymarket.com/markets?condition_id=${pos.conditionId}`
+            : effectiveTokenId
+              ? `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`
+              : pos.marketSlug && pos.marketSlug !== "market" && pos.marketSlug !== "polymarket-market"
+                ? `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(pos.marketSlug)}`
+                : null;
+
+          if (gammaUrl) {
+            const res = await fetch(gammaUrl, { signal: AbortSignal.timeout(4000) });
+            if (res.ok) {
+              const list = (await res.json()) as Array<{
+                closed?: boolean;
+                endDate?: string;
+                endDateIso?: string;
+                tokens?: Array<{ outcome?: string; winner?: boolean }>;
+                outcomePrices?: string[] | string;
+                outcomes?: string[] | string;
+              }>;
+              const market = list[0];
+              if (market) {
+                if (!resolvedMarketDate) {
+                  resolvedMarketDate = market.endDate || market.endDateIso;
+                }
+                if (market.closed === true) {
+                  // Vérification tokens
+                  const winToken = market.tokens?.find((t) => t.winner === true);
+                  if (winToken?.outcome) {
+                    isClosed = true;
+                    winningOutcome = winToken.outcome;
+                  } else {
+                    // Analyse outcomePrices (ex: ["1", "0"])
+                    const prices =
+                      typeof market.outcomePrices === "string"
+                        ? JSON.parse(market.outcomePrices)
+                        : market.outcomePrices;
+                    const outcomes =
+                      typeof market.outcomes === "string"
+                        ? JSON.parse(market.outcomes)
+                        : market.outcomes;
+
+                    if (Array.isArray(prices) && Array.isArray(outcomes)) {
+                      const winIdx = prices.findIndex(
+                        (p: string | number) => Number(p) >= 0.99
+                      );
+                      if (winIdx >= 0 && outcomes[winIdx]) {
+                        isClosed = true;
+                        winningOutcome = String(outcomes[winIdx]);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (_err: unknown) {
+          // Ignorer erreurs temporaires
+        }
+      }
+
+      if (isClosed && winningOutcome) {
+        // Recharger le document frais depuis la base pour éviter toute donnée périmée
+        const freshPos = await this.positionModel.findOne({
+          _id: pos._id,
+          status: { $ne: "CLOSED" },
+        });
+
+        if (!freshPos) continue;
+
+        const isWin =
+          freshPos.outcomeLabel.trim().toLowerCase() === winningOutcome.trim().toLowerCase();
+
+        const settledPayoutUsdc = isWin ? Number(freshPos.totalShares.toFixed(2)) : 0;
+        const realizedPnlUsdc = Number(
+          (settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2)
+        );
+        const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
+        const now = Date.now();
+
+        // Mise à jour conditionnelle atomique : garantit l'idempotence stricte
+        const updatedDoc = await this.positionModel.findOneAndUpdate(
+          {
+            _id: freshPos._id,
+            status: { $ne: "CLOSED" },
+          },
+          {
+            $set: {
+              status: "CLOSED",
+              closeReason,
+              settledPayoutUsdc,
+              realizedPnlUsdc,
+              currentMarketPrice: isWin ? 1.0 : 0.0,
+              currentMarketValueUsdc: settledPayoutUsdc,
+              ...(resolvedMarketDate && !freshPos.endDate ? { endDate: resolvedMarketDate } : {}),
+              closedAt: now,
+              updatedAt: now,
+            },
+          },
+          { new: true }
+        );
+
+        if (!updatedDoc) {
+          continue;
+        }
+
+        settledCount++;
+
+        this.eventsGateway.broadcast("position:closed", {
+          conditionId: updatedDoc.conditionId,
+          positionId: updatedDoc.positionId,
+          closeReason,
+          settledPayoutUsdc,
+          realizedPnlUsdc,
+        });
+
+        // Notification Discord enrichie (une seule fois garantie)
+        const mapped = this.mapToPosition(updatedDoc.toObject());
+        const alias = await this.getTargetAlias(updatedDoc.targetAddress);
+        await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
+      } else if (resolvedMarketDate && !pos.endDate) {
+        // Même si pas encore résolu, sauvegarder la date résolue trouvée
+        await this.positionModel.updateOne(
+          { _id: pos._id },
+          { $set: { endDate: resolvedMarketDate } }
+        );
       }
     }
 
@@ -253,7 +493,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     await Promise.all(
       docs.map(async (doc) => {
         if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
-          const resolvedDate = await this.resolveMarketEndDate(doc.conditionId, doc.marketSlug);
+          const resolvedDate = await this.resolveMarketEndDate(
+            doc.conditionId,
+            doc.marketSlug,
+            doc.assetAddress
+          );
           if (resolvedDate) {
             doc.endDate = resolvedDate;
             await this.positionModel.updateOne(
@@ -275,6 +519,26 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       .limit(100)
       .lean()
       .exec();
+
+    // Résolution paresseuse des dates d'échéance manquantes sur les positions clôturées
+    await Promise.all(
+      docs.map(async (doc) => {
+        if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
+          const resolvedDate = await this.resolveMarketEndDate(
+            doc.conditionId,
+            doc.marketSlug,
+            doc.assetAddress
+          );
+          if (resolvedDate) {
+            doc.endDate = resolvedDate;
+            await this.positionModel.updateOne(
+              { _id: doc._id },
+              { $set: { endDate: resolvedDate } }
+            );
+          }
+        }
+      })
+    );
 
     return docs.map((doc) => this.mapToPosition(doc));
   }
@@ -408,6 +672,27 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     ]);
 
     const rawItems = (aggregationResult?.items || []) as PositionDocument[];
+
+    // Résolution paresseuse des dates d'échéance manquantes sur les items paginés
+    await Promise.all(
+      rawItems.map(async (doc) => {
+        if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
+          const resolvedDate = await this.resolveMarketEndDate(
+            doc.conditionId,
+            doc.marketSlug,
+            doc.assetAddress
+          );
+          if (resolvedDate) {
+            doc.endDate = resolvedDate;
+            await this.positionModel.updateOne(
+              { _id: doc._id },
+              { $set: { endDate: resolvedDate } }
+            );
+          }
+        }
+      })
+    );
+
     const statsDoc = aggregationResult?.stats?.[0] || {
       totalInvested: 0,
       totalPayout: 0,
@@ -497,7 +782,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       const positionId = `pos_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       const resolvedEndDate =
         marketInfo?.endDate ||
-        (await this.resolveMarketEndDate(trade.conditionId, marketInfo?.marketSlug));
+        (await this.resolveMarketEndDate(
+          trade.conditionId,
+          marketInfo?.marketSlug,
+          trade.assetAddress
+        ));
 
       const newPos = new this.positionModel({
         positionId,
@@ -535,8 +824,17 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       existing.unrealizedPnlPercent =
         newTotalInvested > 0 ? (existing.unrealizedPnlUsdc / newTotalInvested) * 100 : 0;
       existing.updatedAt = trade.executedAt;
-      if (!existing.endDate && marketInfo?.endDate) {
-        existing.endDate = marketInfo.endDate;
+      if (!existing.endDate) {
+        const resolved =
+          marketInfo?.endDate ||
+          (await this.resolveMarketEndDate(
+            trade.conditionId,
+            marketInfo?.marketSlug,
+            trade.assetAddress
+          ));
+        if (resolved) {
+          existing.endDate = resolved;
+        }
       }
       savedDoc = await existing.save();
     }
