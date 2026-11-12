@@ -1,8 +1,5 @@
 import { Controller, Get, Param, Post, Query } from "@nestjs/common";
-import {
-  ClosedPositionsQuerySchema,
-  type OpenPosition,
-} from "@polymarket-copy/shared";
+import { ClosedPositionsQuerySchema, type OpenPosition } from "@polymarket-copy/shared";
 import { PositionsService } from "./positions.service.ts";
 
 @Controller("positions")
@@ -15,9 +12,7 @@ export class PositionsController {
   }
 
   @Get("closed")
-  async findClosed(
-    @Query() rawQuery?: Record<string, unknown>
-  ): Promise<
+  async findClosed(@Query() rawQuery?: Record<string, unknown>): Promise<
     | OpenPosition[]
     | {
         items: OpenPosition[];
@@ -30,9 +25,7 @@ export class PositionsController {
   > {
     if (
       rawQuery &&
-      (rawQuery.page !== undefined ||
-        rawQuery.limit !== undefined ||
-        rawQuery.status !== undefined)
+      (rawQuery.page !== undefined || rawQuery.limit !== undefined || rawQuery.status !== undefined)
     ) {
       const parsed = ClosedPositionsQuerySchema.parse(rawQuery);
       return await this.positionsService.findClosedPaginated(parsed);

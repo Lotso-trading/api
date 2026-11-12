@@ -152,10 +152,13 @@ export class PositionsService {
             if (!freshPos) continue;
 
             const isWin =
-              freshPos.outcomeLabel.trim().toLowerCase() === winningToken.outcome.trim().toLowerCase();
+              freshPos.outcomeLabel.trim().toLowerCase() ===
+              winningToken.outcome.trim().toLowerCase();
 
             const settledPayoutUsdc = isWin ? Number(freshPos.totalShares.toFixed(2)) : 0;
-            const realizedPnlUsdc = Number((settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2));
+            const realizedPnlUsdc = Number(
+              (settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2)
+            );
             const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
             const now = Date.now();
 
@@ -288,21 +291,14 @@ export class PositionsService {
 
     const since = query.since ? Number(query.since) : undefined;
     if (since && since > 0) {
-      matchQuery.$or = [
-        { closedAt: { $gte: since } },
-        { updatedAt: { $gte: since } },
-      ];
+      matchQuery.$or = [{ closedAt: { $gte: since } }, { updatedAt: { $gte: since } }];
     }
 
     const [aggregationResult] = await this.positionModel.aggregate([
       { $match: matchQuery },
       {
         $facet: {
-          items: [
-            { $sort: { closedAt: -1, updatedAt: -1 } },
-            { $skip: skip },
-            { $limit: limit },
-          ],
+          items: [{ $sort: { closedAt: -1, updatedAt: -1 } }, { $skip: skip }, { $limit: limit }],
           stats: [
             {
               $group: {
@@ -573,6 +569,7 @@ export class PositionsService {
       settledPayoutUsdc:
         doc.settledPayoutUsdc !== undefined ? Number(doc.settledPayoutUsdc) : undefined,
       realizedPnlUsdc: doc.realizedPnlUsdc !== undefined ? Number(doc.realizedPnlUsdc) : undefined,
+      settleTxHash: doc.settleTxHash ? String(doc.settleTxHash) : undefined,
       closedAt: doc.closedAt ? Number(doc.closedAt) : undefined,
       totalShares: Number(doc.totalShares),
       avgEntryPrice: Number(doc.avgEntryPrice),

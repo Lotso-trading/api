@@ -38,6 +38,9 @@ export class PositionModel {
   @Prop({ required: false })
   realizedPnlUsdc?: number;
 
+  @Prop({ required: false })
+  settleTxHash?: string;
+
   @Prop({ required: false, index: true })
   closedAt?: number;
 
