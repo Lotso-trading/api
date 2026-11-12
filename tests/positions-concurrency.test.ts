@@ -216,3 +216,113 @@ Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pa
   assertEquals(paginated.totals.totalInvested, 2750);
   assertEquals(paginated.totals.totalPayout, 4000);
 });
+
+Deno.test("PositionsService - findUnredeemedWinningPositions filtre les positions gagnantes sans tx de rachat", async () => {
+  let filterCaptured: unknown = null;
+  const mockPositionModel = {
+    find: (filter: unknown) => {
+      filterCaptured = filter;
+      return {
+        sort: () => ({
+          lean: () => ({
+            exec: () =>
+              Promise.resolve([
+                {
+                  positionId: "pos_win_unredeemed",
+                  conditionId: "0xwin1",
+                  assetAddress: "0x1111111111111111111111111111111111111111",
+                  marketSlug: "slug-win",
+                  marketQuestion: "Will it rain?",
+                  outcomeLabel: "Yes",
+                  status: "CLOSED",
+                  closeReason: "RESOLVED_WIN",
+                  settledPayoutUsdc: 25.0,
+                  totalShares: 25.0,
+                  avgEntryPrice: 0.4,
+                  totalInvestedUsdc: 10.0,
+                  currentMarketPrice: 1.0,
+                  currentMarketValueUsdc: 25.0,
+                  unrealizedPnlUsdc: 0,
+                  unrealizedPnlPercent: 0,
+                  targetAddress: "0x2222222222222222222222222222222222222222",
+                  openedAt: Date.now() - 100000,
+                  updatedAt: Date.now(),
+                },
+              ]),
+          }),
+        }),
+      };
+    },
+  };
+
+  const service = new PositionsService(
+    mockPositionModel as unknown as Model<PositionDocument>,
+    {} as unknown as Model<TargetDocument>,
+    { broadcast: () => {} } as unknown as EventsGateway,
+    {} as unknown as DiscordNotifierService
+  );
+
+  const unredeemed = await service.findUnredeemedWinningPositions();
+
+  assertEquals(unredeemed.length, 1);
+  assertEquals(unredeemed[0]?.conditionId, "0xwin1");
+  assertEquals(unredeemed[0]?.settledPayoutUsdc, 25.0);
+  assertEquals(filterCaptured !== null, true);
+});
+
+Deno.test("PositionsService - recordPositionRedeemed enregistre la tx et diffuse l'événement", async () => {
+  let broadcastEvent = "";
+  let broadcastPayload: unknown = null;
+
+  const mockPositionModel = {
+    findOneAndUpdate: (_filter: unknown, update: { $set: { settleTxHash: string } }) => {
+      return {
+        lean: () => ({
+          exec: () =>
+            Promise.resolve({
+              positionId: "pos_win_1",
+              conditionId: "0xwin1",
+              assetAddress: "0x1111111111111111111111111111111111111111",
+              marketSlug: "slug-win",
+              marketQuestion: "Will it rain?",
+              outcomeLabel: "Yes",
+              status: "CLOSED",
+              closeReason: "RESOLVED_WIN",
+              settledPayoutUsdc: 50.0,
+              settleTxHash: update.$set.settleTxHash,
+              totalShares: 50.0,
+              avgEntryPrice: 0.5,
+              totalInvestedUsdc: 25.0,
+              currentMarketPrice: 1.0,
+              currentMarketValueUsdc: 50.0,
+              unrealizedPnlUsdc: 0,
+              unrealizedPnlPercent: 0,
+              targetAddress: "0x2222222222222222222222222222222222222222",
+              openedAt: Date.now() - 100000,
+              updatedAt: Date.now(),
+            }),
+        }),
+      };
+    },
+  };
+
+  const mockGateway = {
+    broadcast: (event: string, payload: unknown) => {
+      broadcastEvent = event;
+      broadcastPayload = payload;
+    },
+  } as unknown as EventsGateway;
+
+  const service = new PositionsService(
+    mockPositionModel as unknown as Model<PositionDocument>,
+    {} as unknown as Model<TargetDocument>,
+    mockGateway,
+    {} as unknown as DiscordNotifierService
+  );
+
+  const updated = await service.recordPositionRedeemed("0xwin1", "0xreal_tx_hash_12345");
+
+  assertEquals(updated.settleTxHash, "0xreal_tx_hash_12345");
+  assertEquals(broadcastEvent, "position:redeemed");
+  assertEquals((broadcastPayload as { txHash: string }).txHash, "0xreal_tx_hash_12345");
+});

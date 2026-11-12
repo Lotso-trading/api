@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Post, Query } from "@nestjs/common";
+import { Body, Controller, Get, Param, Post, Query } from "@nestjs/common";
 import { ClosedPositionsQuerySchema, type OpenPosition } from "@polymarket-copy/shared";
 import { PositionsService } from "./positions.service.ts";
 
@@ -33,6 +33,11 @@ export class PositionsController {
     return await this.positionsService.findClosed();
   }
 
+  @Get("unredeemed")
+  async findUnredeemed(): Promise<OpenPosition[]> {
+    return await this.positionsService.findUnredeemedWinningPositions();
+  }
+
   @Post("settle")
   async settle(): Promise<{ settledCount: number; message: string }> {
     const settledCount = await this.positionsService.settleResolvedPositions(true);
@@ -40,6 +45,14 @@ export class PositionsController {
       settledCount,
       message: `${settledCount} position(s) résolue(s) et créditée(s) au cash disponible.`,
     };
+  }
+
+  @Post(":conditionId/redeem")
+  async recordRedeem(
+    @Param("conditionId") conditionId: string,
+    @Body() body: { txHash: string }
+  ): Promise<OpenPosition> {
+    return await this.positionsService.recordPositionRedeemed(conditionId, body.txHash);
   }
 
   @Get(":id")

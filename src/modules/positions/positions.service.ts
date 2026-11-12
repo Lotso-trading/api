@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import {
+  Injectable,
+  NotFoundException,
+  type OnModuleDestroy,
+  type OnModuleInit,
+} from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { ClosedPositionsQuery, ExecutedTrade, OpenPosition } from "@polymarket-copy/shared";
 import type { Model } from "mongoose";
@@ -8,11 +13,12 @@ import { EventsGateway } from "../gateway/events.gateway.ts";
 import { DiscordNotifierService } from "../notifications/discord-notifier.service.ts";
 
 @Injectable()
-export class PositionsService {
+export class PositionsService implements OnModuleInit, OnModuleDestroy {
   private readonly marketEndDateCache = new Map<string, string>();
   private settlePromise: Promise<number> | null = null;
   private lastAutoSettleTimestamp = 0;
   private readonly autoSettleThrottleMs = 30_000; // Throttling 30s entre deux vérifications automatiques
+  private autoSettleIntervalId: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     @InjectModel(PositionModel.name)
@@ -22,6 +28,22 @@ export class PositionsService {
     private readonly eventsGateway: EventsGateway,
     private readonly discordNotifier: DiscordNotifierService
   ) {}
+
+  onModuleInit(): void {
+    // Vérification périodique de résolution automatique toutes les 60s en arrière-plan
+    this.autoSettleIntervalId = setInterval(() => {
+      this.settleResolvedPositions(false).catch((err: unknown) => {
+        console.warn("[PositionsService] Erreur lors de la vérification de settlement automatique:", err);
+      });
+    }, 60_000);
+  }
+
+  onModuleDestroy(): void {
+    if (this.autoSettleIntervalId !== null) {
+      clearInterval(this.autoSettleIntervalId);
+      this.autoSettleIntervalId = null;
+    }
+  }
 
   private async getTargetAlias(address?: string): Promise<string | undefined> {
     if (!address) return undefined;
@@ -255,6 +277,56 @@ export class PositionsService {
       .exec();
 
     return docs.map((doc) => this.mapToPosition(doc));
+  }
+
+  async findUnredeemedWinningPositions(): Promise<OpenPosition[]> {
+    const docs = await this.positionModel
+      .find({
+        status: "CLOSED",
+        closeReason: "RESOLVED_WIN",
+        settledPayoutUsdc: { $gt: 0 },
+        $or: [
+          { settleTxHash: { $exists: false } },
+          { settleTxHash: "" },
+          { settleTxHash: null },
+        ],
+      })
+      .sort({ closedAt: -1, updatedAt: -1 })
+      .lean()
+      .exec();
+
+    return docs.map((doc) => this.mapToPosition(doc));
+  }
+
+  async recordPositionRedeemed(conditionId: string, txHash: string): Promise<OpenPosition> {
+    const updated = await this.positionModel
+      .findOneAndUpdate(
+        { conditionId },
+        {
+          $set: {
+            settleTxHash: txHash,
+            updatedAt: Date.now(),
+          },
+        },
+        { new: true }
+      )
+      .lean()
+      .exec();
+
+    if (!updated) {
+      throw new NotFoundException(
+        `Position non trouvée pour conditionId=${conditionId} lors de l'enregistrement du rachat`
+      );
+    }
+
+    const mapped = this.mapToPosition(updated);
+    this.eventsGateway.broadcast("position:redeemed", {
+      conditionId,
+      txHash,
+      settledPayoutUsdc: mapped.settledPayoutUsdc,
+    });
+
+    return mapped;
   }
 
   async findClosedPaginated(query: ClosedPositionsQuery): Promise<{
