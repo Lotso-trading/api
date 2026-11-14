@@ -25,7 +25,10 @@ export class PositionsController {
   > {
     if (
       rawQuery &&
-      (rawQuery.page !== undefined || rawQuery.limit !== undefined || rawQuery.status !== undefined)
+      (rawQuery.page !== undefined ||
+        rawQuery.limit !== undefined ||
+        rawQuery.status !== undefined ||
+        rawQuery.since !== undefined)
     ) {
       const parsed = ClosedPositionsQuerySchema.parse(rawQuery);
       return await this.positionsService.findClosedPaginated(parsed);
