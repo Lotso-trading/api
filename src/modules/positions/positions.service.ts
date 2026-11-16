@@ -14,7 +14,10 @@ import { DiscordNotifierService } from "../notifications/discord-notifier.servic
 
 @Injectable()
 export class PositionsService implements OnModuleInit, OnModuleDestroy {
-  private readonly marketEndDateCache = new Map<string, { date: string; timestamp: number }>();
+  private readonly marketEndDateCache = new Map<
+    string,
+    { date: string; eventSlug?: string; timestamp: number }
+  >();
   private settlePromise: Promise<number> | null = null;
   private lastAutoSettleTimestamp = 0;
   private readonly autoSettleThrottleMs = 30_000; // Throttling 30s entre deux vérifications automatiques
@@ -40,9 +43,9 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       });
     }, 60_000);
 
-    // Lancement en tâche de fond de la rétro-résolution des dates d'échéance manquantes
-    this.backfillMissingEndDates().catch((err: unknown) => {
-      console.warn("[PositionsService] Erreur backfill dates:", err);
+    // Lancement en tâche de fond de la rétro-résolution des métadonnées manquantes (dates, eventSlug)
+    this.backfillMissingMetadata().catch((err: unknown) => {
+      console.warn("[PositionsService] Erreur backfill metadata:", err);
     });
   }
 
@@ -53,40 +56,56 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async backfillMissingEndDates(): Promise<void> {
+  private async backfillMissingMetadata(): Promise<void> {
     try {
-      const positionsWithoutDate = await this.positionModel
+      const positionsToBackfill = await this.positionModel
         .find({
-          $or: [{ endDate: { $exists: false } }, { endDate: "" }, { endDate: null }],
+          $or: [
+            { endDate: { $exists: false } },
+            { endDate: "" },
+            { endDate: null },
+            { eventSlug: { $exists: false } },
+            { eventSlug: "" },
+            { eventSlug: null },
+          ],
           conditionId: { $ne: "0x" },
         })
         .limit(200)
         .exec();
 
-      if (positionsWithoutDate.length === 0) return;
+      if (positionsToBackfill.length === 0) return;
 
       console.log(
-        `[PositionsService] 🔄 Début de la rétro-résolution des dates pour ${positionsWithoutDate.length} position(s)...`
+        `[PositionsService] 🔄 Début de la rétro-résolution des métadonnées pour ${positionsToBackfill.length} position(s)...`
       );
 
       let resolvedCount = 0;
-      for (const pos of positionsWithoutDate) {
-        const resolved = await this.resolveMarketEndDate(
+      for (const pos of positionsToBackfill) {
+        const resolved = await this.resolveMarketMetadata(
           pos.conditionId,
           pos.marketSlug,
           pos.assetAddress
         );
-        if (resolved) {
-          await this.positionModel.updateOne({ _id: pos._id }, { $set: { endDate: resolved } });
+        const updateFields: Record<string, string> = {};
+        if (resolved.endDate && !pos.endDate) {
+          pos.endDate = resolved.endDate;
+          updateFields.endDate = resolved.endDate;
+        }
+        if (resolved.eventSlug && !pos.eventSlug) {
+          pos.eventSlug = resolved.eventSlug;
+          updateFields.eventSlug = resolved.eventSlug;
+        }
+        if (Object.keys(updateFields).length > 0) {
+          await this.positionModel.updateOne({ _id: pos._id }, { $set: updateFields });
           resolvedCount++;
         }
       }
 
       console.log(
-        `[PositionsService] ✅ Rétro-résolution terminée : ${resolvedCount}/${positionsWithoutDate.length} date(s) mise(s) à jour en base.`
+        `[PositionsService] ✅ Rétro-résolution terminée : ${resolvedCount}/${positionsToBackfill.length} position(s) mise(s) à jour en base.`
       );
     } catch (err: unknown) {
-      console.warn("[PositionsService] Erreur lors de la rétro-résolution des dates:", err);
+      console.warn("[PositionsService] Erreur lors de la rétro-résolution des métadonnées:", err);
     }
   }
 
@@ -103,24 +122,25 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async resolveMarketEndDate(
+  async resolveMarketMetadata(
     conditionId: string,
     marketSlug?: string,
     assetAddress?: string
-  ): Promise<string | undefined> {
-    if (!conditionId || conditionId === "0x") return undefined;
+  ): Promise<{ endDate?: string; eventSlug?: string }> {
+    if (!conditionId || conditionId === "0x") return {};
 
     const cached = this.marketEndDateCache.get(conditionId);
     if (cached) {
-      // Date trouvée : mise en cache permanente
-      if (cached.date) {
-        return cached.date;
+      if (cached.date || cached.eventSlug) {
+        return { endDate: cached.date || undefined, eventSlug: cached.eventSlug };
       }
-      // Échec temporaire : ne ré-interroger qu'après 5 minutes (TTL 300s)
       if (Date.now() - cached.timestamp < 300_000) {
-        return undefined;
+        return {};
       }
     }
+
+    let resolvedDate: string | undefined;
+    let resolvedEventSlug: string | undefined;
 
     const isHexConditionId = conditionId.startsWith("0x") && conditionId.length >= 64;
     const isTokenIdDecimal = !isHexConditionId && /^\d+$/.test(conditionId);
@@ -142,11 +162,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
           game_start_time?: string;
           endDate?: string;
         };
-        const resolved = data?.end_date_iso || data?.game_start_time || data?.endDate;
-        if (resolved) {
-          this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
-          return resolved;
-        }
+        resolvedDate = data?.end_date_iso || data?.game_start_time || data?.endDate;
       }
     } catch (_err: unknown) {
       // Poursuite vers Gamma
@@ -164,11 +180,13 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             endDate?: string;
             endDateIso?: string;
             game_start_time?: string;
+            events?: Array<{ slug?: string }>;
           }>;
-          const resolved = list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
-          if (resolved) {
-            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
-            return resolved;
+          if (!resolvedDate) {
+            resolvedDate = list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
+          }
+          if (!resolvedEventSlug) {
+            resolvedEventSlug = list[0]?.events?.[0]?.slug;
           }
         }
       } catch (_err: unknown) {
@@ -183,7 +201,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         ? assetAddress
         : null;
 
-    if (effectiveTokenId) {
+    if (effectiveTokenId && (!resolvedDate || !resolvedEventSlug)) {
       try {
         const res = await fetch(
           `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`,
@@ -194,11 +212,13 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             endDate?: string;
             endDateIso?: string;
             game_start_time?: string;
+            events?: Array<{ slug?: string }>;
           }>;
-          const resolved = list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
-          if (resolved) {
-            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
-            return resolved;
+          if (!resolvedDate) {
+            resolvedDate = list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
+          }
+          if (!resolvedEventSlug) {
+            resolvedEventSlug = list[0]?.events?.[0]?.slug;
           }
         }
       } catch (_err: unknown) {
@@ -208,6 +228,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
 
     // 4. Appel Gamma API par slug (Events puis Markets)
     if (
+      (!resolvedDate || !resolvedEventSlug) &&
       marketSlug &&
       marketSlug !== "market" &&
       marketSlug !== "polymarket-market" &&
@@ -221,19 +242,21 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         );
         if (eventRes.ok) {
           const eventList = (await eventRes.json()) as Array<{
+            slug?: string;
             endDate?: string;
             endDateIso?: string;
             markets?: Array<{ endDate?: string; endDateIso?: string }>;
           }>;
           const ev = eventList[0];
-          const resolved =
-            ev?.endDate ||
-            ev?.endDateIso ||
-            ev?.markets?.[0]?.endDate ||
-            ev?.markets?.[0]?.endDateIso;
-          if (resolved) {
-            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
-            return resolved;
+          if (!resolvedDate) {
+            resolvedDate =
+              ev?.endDate ||
+              ev?.endDateIso ||
+              ev?.markets?.[0]?.endDate ||
+              ev?.markets?.[0]?.endDateIso;
+          }
+          if (!resolvedEventSlug) {
+            resolvedEventSlug = ev?.slug || marketSlug;
           }
         }
       } catch (_err: unknown) {
@@ -241,30 +264,52 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       }
 
       // 4.2 Test sur /markets?slug=
-      try {
-        const marketRes = await fetch(
-          `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(marketSlug)}`,
-          { signal: AbortSignal.timeout(5000) }
-        );
-        if (marketRes.ok) {
-          const marketList = (await marketRes.json()) as Array<{
-            endDate?: string;
-            endDateIso?: string;
-          }>;
-          const resolved = marketList[0]?.endDate || marketList[0]?.endDateIso;
-          if (resolved) {
-            this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
-            return resolved;
+      if (!resolvedDate || !resolvedEventSlug) {
+        try {
+          const marketRes = await fetch(
+            `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(marketSlug)}`,
+            { signal: AbortSignal.timeout(5000) }
+          );
+          if (marketRes.ok) {
+            const marketList = (await marketRes.json()) as Array<{
+              endDate?: string;
+              endDateIso?: string;
+              events?: Array<{ slug?: string }>;
+            }>;
+            if (!resolvedDate) {
+              resolvedDate = marketList[0]?.endDate || marketList[0]?.endDateIso;
+            }
+            if (!resolvedEventSlug) {
+              resolvedEventSlug = marketList[0]?.events?.[0]?.slug;
+            }
           }
+        } catch (_err: unknown) {
+          // Ignoré
         }
-      } catch (_err: unknown) {
-        // Ignoré
       }
+    }
+
+    if (resolvedDate || resolvedEventSlug) {
+      this.marketEndDateCache.set(conditionId, {
+        date: resolvedDate || "",
+        eventSlug: resolvedEventSlug,
+        timestamp: Date.now(),
+      });
+      return { endDate: resolvedDate, eventSlug: resolvedEventSlug };
     }
 
     // Cache négatif temporaire (5 min) pour éviter le spam réseau sans bloquer ad vitam
     this.marketEndDateCache.set(conditionId, { date: "", timestamp: Date.now() });
-    return undefined;
+    return {};
+  }
+
+  async resolveMarketEndDate(
+    conditionId: string,
+    marketSlug?: string,
+    assetAddress?: string
+  ): Promise<string | undefined> {
+    const meta = await this.resolveMarketMetadata(conditionId, marketSlug, assetAddress);
+    return meta.endDate;
   }
 
   async settleResolvedPositions(force = false): Promise<number> {
@@ -363,6 +408,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                 closed?: boolean;
                 endDate?: string;
                 endDateIso?: string;
+                events?: Array<{ slug?: string }>;
                 tokens?: Array<{ outcome?: string; winner?: boolean }>;
                 outcomePrices?: string[] | string;
                 outcomes?: string[] | string;
@@ -371,6 +417,14 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
               if (market) {
                 if (!resolvedMarketDate) {
                   resolvedMarketDate = market.endDate || market.endDateIso;
+                }
+                const resolvedEventSlug = market.events?.[0]?.slug;
+                if (!pos.eventSlug && resolvedEventSlug) {
+                  pos.eventSlug = resolvedEventSlug;
+                  await this.positionModel.updateOne(
+                    { _id: pos._id },
+                    { $set: { eventSlug: resolvedEventSlug } }
+                  );
                 }
                 if (market.closed === true) {
                   // Vérification tokens
@@ -506,20 +560,28 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       .lean()
       .exec();
 
-    // Résolution paresseuse des dates d'échéance manquantes
+    // Résolution paresseuse des métadonnées manquantes (dates, eventSlug)
     await Promise.all(
       docs.map(async (doc) => {
-        if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
-          const resolvedDate = await this.resolveMarketEndDate(
+        if ((!doc.endDate || !doc.eventSlug) && doc.conditionId && doc.conditionId !== "0x") {
+          const resolved = await this.resolveMarketMetadata(
             doc.conditionId,
             doc.marketSlug,
             doc.assetAddress
           );
-          if (resolvedDate) {
-            doc.endDate = resolvedDate;
+          const updateFields: Record<string, string> = {};
+          if (resolved.endDate && !doc.endDate) {
+            doc.endDate = resolved.endDate;
+            updateFields.endDate = resolved.endDate;
+          }
+          if (resolved.eventSlug && !doc.eventSlug) {
+            doc.eventSlug = resolved.eventSlug;
+            updateFields.eventSlug = resolved.eventSlug;
+          }
+          if (Object.keys(updateFields).length > 0) {
             await this.positionModel.updateOne(
               { _id: doc._id },
-              { $set: { endDate: resolvedDate } }
+              { $set: updateFields }
             );
           }
         }
@@ -537,20 +599,28 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       .lean()
       .exec();
 
-    // Résolution paresseuse des dates d'échéance manquantes sur les positions clôturées
+    // Résolution paresseuse des métadonnées manquantes sur les positions clôturées
     await Promise.all(
       docs.map(async (doc) => {
-        if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
-          const resolvedDate = await this.resolveMarketEndDate(
+        if ((!doc.endDate || !doc.eventSlug) && doc.conditionId && doc.conditionId !== "0x") {
+          const resolved = await this.resolveMarketMetadata(
             doc.conditionId,
             doc.marketSlug,
             doc.assetAddress
           );
-          if (resolvedDate) {
-            doc.endDate = resolvedDate;
+          const updateFields: Record<string, string> = {};
+          if (resolved.endDate && !doc.endDate) {
+            doc.endDate = resolved.endDate;
+            updateFields.endDate = resolved.endDate;
+          }
+          if (resolved.eventSlug && !doc.eventSlug) {
+            doc.eventSlug = resolved.eventSlug;
+            updateFields.eventSlug = resolved.eventSlug;
+          }
+          if (Object.keys(updateFields).length > 0) {
             await this.positionModel.updateOne(
               { _id: doc._id },
-              { $set: { endDate: resolvedDate } }
+              { $set: updateFields }
             );
           }
         }
@@ -686,20 +756,28 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
 
     const rawItems = (aggregationResult?.items || []) as PositionDocument[];
 
-    // Résolution paresseuse des dates d'échéance manquantes sur les items paginés
+    // Résolution paresseuse des métadonnées manquantes sur les items paginés
     await Promise.all(
       rawItems.map(async (doc) => {
-        if (!doc.endDate && doc.conditionId && doc.conditionId !== "0x") {
-          const resolvedDate = await this.resolveMarketEndDate(
+        if ((!doc.endDate || !doc.eventSlug) && doc.conditionId && doc.conditionId !== "0x") {
+          const resolved = await this.resolveMarketMetadata(
             doc.conditionId,
             doc.marketSlug,
             doc.assetAddress
           );
-          if (resolvedDate) {
-            doc.endDate = resolvedDate;
+          const updateFields: Record<string, string> = {};
+          if (resolved.endDate && !doc.endDate) {
+            doc.endDate = resolved.endDate;
+            updateFields.endDate = resolved.endDate;
+          }
+          if (resolved.eventSlug && !doc.eventSlug) {
+            doc.eventSlug = resolved.eventSlug;
+            updateFields.eventSlug = resolved.eventSlug;
+          }
+          if (Object.keys(updateFields).length > 0) {
             await this.positionModel.updateOne(
               { _id: doc._id },
-              { $set: { endDate: resolvedDate } }
+              { $set: updateFields }
             );
           }
         }
@@ -777,6 +855,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     trade: ExecutedTrade,
     marketInfo?: {
       marketSlug?: string;
+      eventSlug?: string;
       marketQuestion?: string;
       outcomeLabel?: string;
       endDate?: string;
@@ -793,19 +872,20 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
 
     if (!existing) {
       const positionId = `pos_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      const resolvedEndDate =
-        marketInfo?.endDate ||
-        (await this.resolveMarketEndDate(
-          trade.conditionId,
-          marketInfo?.marketSlug,
-          trade.assetAddress
-        ));
+      const resolvedMeta = await this.resolveMarketMetadata(
+        trade.conditionId,
+        marketInfo?.marketSlug,
+        trade.assetAddress
+      );
+      const resolvedEndDate = marketInfo?.endDate || resolvedMeta.endDate;
+      const resolvedEventSlug = marketInfo?.eventSlug || trade.eventSlug || resolvedMeta.eventSlug;
 
       const newPos = new this.positionModel({
         positionId,
         conditionId: trade.conditionId,
         assetAddress: (trade.assetAddress || trade.conditionId).toLowerCase(),
         marketSlug: marketInfo?.marketSlug || "market",
+        eventSlug: resolvedEventSlug,
         marketQuestion: marketInfo?.marketQuestion || "Polymarket Question",
         outcomeLabel: marketInfo?.outcomeLabel || "Yes",
         endDate: resolvedEndDate,
@@ -837,16 +917,17 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       existing.unrealizedPnlPercent =
         newTotalInvested > 0 ? (existing.unrealizedPnlUsdc / newTotalInvested) * 100 : 0;
       existing.updatedAt = trade.executedAt;
-      if (!existing.endDate) {
-        const resolved =
-          marketInfo?.endDate ||
-          (await this.resolveMarketEndDate(
-            trade.conditionId,
-            marketInfo?.marketSlug,
-            trade.assetAddress
-          ));
-        if (resolved) {
-          existing.endDate = resolved;
+      if (!existing.endDate || !existing.eventSlug) {
+        const resolved = await this.resolveMarketMetadata(
+          trade.conditionId,
+          marketInfo?.marketSlug,
+          trade.assetAddress
+        );
+        if (!existing.endDate && (marketInfo?.endDate || resolved.endDate)) {
+          existing.endDate = marketInfo?.endDate || resolved.endDate;
+        }
+        if (!existing.eventSlug && (marketInfo?.eventSlug || trade.eventSlug || resolved.eventSlug)) {
+          existing.eventSlug = marketInfo?.eventSlug || trade.eventSlug || resolved.eventSlug;
         }
       }
       savedDoc = await existing.save();
@@ -961,6 +1042,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
       conditionId: String(doc.conditionId),
       assetAddress: String(doc.assetAddress),
       marketSlug: String(doc.marketSlug),
+      eventSlug: doc.eventSlug ? String(doc.eventSlug) : undefined,
       marketQuestion: String(doc.marketQuestion),
       outcomeLabel: String(doc.outcomeLabel),
       endDate: doc.endDate ? String(doc.endDate) : undefined,

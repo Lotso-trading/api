@@ -17,6 +17,9 @@ export class PositionModel {
   @Prop({ required: true })
   marketSlug!: string;
 
+  @Prop({ required: false, trim: true })
+  eventSlug?: string;
+
   @Prop({ required: true })
   marketQuestion!: string;
 

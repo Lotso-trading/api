@@ -72,6 +72,7 @@ export class TradesService {
       targetAddress: trade.targetAddress.toLowerCase(),
       conditionId: trade.conditionId,
       marketSlug: trade.marketSlug,
+      eventSlug: trade.eventSlug,
       marketQuestion: trade.marketQuestion,
       outcomeLabel: trade.outcomeLabel,
       side: trade.side,
@@ -96,6 +97,7 @@ export class TradesService {
       if (trade.side === "BUY") {
         await this.positionsService.recordBuy(trade, {
           marketSlug: trade.marketSlug,
+          eventSlug: trade.eventSlug,
           marketQuestion: trade.marketQuestion,
           outcomeLabel: trade.outcomeLabel,
           endDate: trade.endDate,
@@ -153,6 +155,7 @@ export class TradesService {
       targetAddress: String(doc.targetAddress),
       conditionId: String(doc.conditionId),
       marketSlug: doc.marketSlug ? String(doc.marketSlug) : undefined,
+      eventSlug: doc.eventSlug ? String(doc.eventSlug) : undefined,
       marketQuestion: doc.marketQuestion ? String(doc.marketQuestion) : undefined,
       outcomeLabel: doc.outcomeLabel ? String(doc.outcomeLabel) : undefined,
       side: doc.side as ExecutedTrade["side"],

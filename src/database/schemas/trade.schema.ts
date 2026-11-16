@@ -21,6 +21,9 @@ export class TradeModel {
   @Prop({ required: false })
   marketSlug?: string;
 
+  @Prop({ required: false, trim: true })
+  eventSlug?: string;
+
   @Prop({ required: false })
   marketQuestion?: string;
 
