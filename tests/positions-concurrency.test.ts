@@ -401,7 +401,10 @@ Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API qua
       exec: () => Promise.resolve([mockPos]),
     }),
     findOne: () => Promise.resolve(mockPos),
-    findOneAndUpdate: (_filter: unknown, update: { $set: { status: string; closeReason: string } }) => {
+    findOneAndUpdate: (
+      _filter: unknown,
+      update: { $set: { status: string; closeReason: string } }
+    ) => {
       settledCalled = true;
       assertEquals(update.$set.status, "CLOSED");
       assertEquals(update.$set.closeReason, "RESOLVED_WIN");
@@ -418,7 +421,9 @@ Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API qua
     const urlStr = String(url);
     // CLOB échoue ou ne renvoie pas encore de winner
     if (urlStr.includes("clob.polymarket.com")) {
-      return Promise.resolve(new Response(JSON.stringify({ closed: true, tokens: [] }), { status: 200 }));
+      return Promise.resolve(
+        new Response(JSON.stringify({ closed: true, tokens: [] }), { status: 200 })
+      );
     }
     // Gamma renvoie le résultat avec outcomePrices
     if (urlStr.includes("gamma-api.polymarket.com")) {
@@ -442,7 +447,9 @@ Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API qua
   try {
     const service = new PositionsService(
       mockPositionModel as unknown as Model<PositionDocument>,
-      { findOne: () => ({ lean: () => ({ exec: () => Promise.resolve(null) }) }) } as unknown as Model<TargetDocument>,
+      {
+        findOne: () => ({ lean: () => ({ exec: () => Promise.resolve(null) }) }),
+      } as unknown as Model<TargetDocument>,
       { broadcast: () => {} } as unknown as EventsGateway,
       { sendClosedPositionAlert: () => Promise.resolve() } as unknown as DiscordNotifierService
     );

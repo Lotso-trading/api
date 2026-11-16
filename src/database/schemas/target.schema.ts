@@ -17,6 +17,12 @@ export class TargetStatsModel implements TargetTraderStats {
 
   @Prop({ required: true, default: 0 })
   winRatePercent!: number;
+
+  @Prop({ required: false, default: 0 })
+  wonTrades?: number;
+
+  @Prop({ required: false, default: 0 })
+  lostTrades?: number;
 }
 
 const TargetStatsSchema = SchemaFactory.createForClass(TargetStatsModel);

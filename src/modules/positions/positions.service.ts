@@ -33,7 +33,10 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
     // Vérification périodique de résolution automatique toutes les 60s en arrière-plan
     this.autoSettleIntervalId = setInterval(() => {
       this.settleResolvedPositions(false).catch((err: unknown) => {
-        console.warn("[PositionsService] Erreur lors de la vérification de settlement automatique:", err);
+        console.warn(
+          "[PositionsService] Erreur lors de la vérification de settlement automatique:",
+          err
+        );
       });
     }, 60_000);
 
@@ -74,10 +77,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
           pos.assetAddress
         );
         if (resolved) {
-          await this.positionModel.updateOne(
-            { _id: pos._id },
-            { $set: { endDate: resolved } }
-          );
+          await this.positionModel.updateOne({ _id: pos._id }, { $set: { endDate: resolved } });
           resolvedCount++;
         }
       }
@@ -227,7 +227,10 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
           }>;
           const ev = eventList[0];
           const resolved =
-            ev?.endDate || ev?.endDateIso || ev?.markets?.[0]?.endDate || ev?.markets?.[0]?.endDateIso;
+            ev?.endDate ||
+            ev?.endDateIso ||
+            ev?.markets?.[0]?.endDate ||
+            ev?.markets?.[0]?.endDateIso;
           if (resolved) {
             this.marketEndDateCache.set(conditionId, { date: resolved, timestamp: Date.now() });
             return resolved;
@@ -347,7 +350,9 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             ? `https://gamma-api.polymarket.com/markets?condition_id=${pos.conditionId}`
             : effectiveTokenId
               ? `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`
-              : pos.marketSlug && pos.marketSlug !== "market" && pos.marketSlug !== "polymarket-market"
+              : pos.marketSlug &&
+                  pos.marketSlug !== "market" &&
+                  pos.marketSlug !== "polymarket-market"
                 ? `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(pos.marketSlug)}`
                 : null;
 
@@ -385,9 +390,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         : market.outcomes;
 
                     if (Array.isArray(prices) && Array.isArray(outcomes)) {
-                      const winIdx = prices.findIndex(
-                        (p: string | number) => Number(p) >= 0.99
-                      );
+                      const winIdx = prices.findIndex((p: string | number) => Number(p) >= 0.99);
                       if (winIdx >= 0 && outcomes[winIdx]) {
                         isClosed = true;
                         winningOutcome = String(outcomes[winIdx]);
@@ -416,9 +419,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
           freshPos.outcomeLabel.trim().toLowerCase() === winningOutcome.trim().toLowerCase();
 
         const settledPayoutUsdc = isWin ? Number(freshPos.totalShares.toFixed(2)) : 0;
-        const realizedPnlUsdc = Number(
-          (settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2)
-        );
+        const realizedPnlUsdc = Number((settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2));
         const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
         const now = Date.now();
 
@@ -457,6 +458,22 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
           settledPayoutUsdc,
           realizedPnlUsdc,
         });
+
+        if (updatedDoc.targetAddress) {
+          await this.targetModel
+            .updateOne(
+              { address: updatedDoc.targetAddress.toLowerCase() },
+              {
+                $inc: {
+                  "stats.realizedPnlUsdc": realizedPnlUsdc,
+                  ...(isWin ? { "stats.wonTrades": 1 } : { "stats.lostTrades": 1 }),
+                },
+              }
+            )
+            .catch((e) =>
+              console.warn("[PositionsService] Erreur mise à jour stats cible sur clôture:", e)
+            );
+        }
 
         // Notification Discord enrichie (une seule fois garantie)
         const mapped = this.mapToPosition(updatedDoc.toObject());
@@ -549,11 +566,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         status: "CLOSED",
         closeReason: "RESOLVED_WIN",
         settledPayoutUsdc: { $gt: 0 },
-        $or: [
-          { settleTxHash: { $exists: false } },
-          { settleTxHash: "" },
-          { settleTxHash: null },
-        ],
+        $or: [{ settleTxHash: { $exists: false } }, { settleTxHash: "" }, { settleTxHash: null }],
       })
       .sort({ closedAt: -1, updatedAt: -1 })
       .lean()
@@ -890,6 +903,23 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         settledPayoutUsdc: proceeds,
         realizedPnlUsdc: updated.realizedPnlUsdc,
       });
+
+      if (updated.targetAddress) {
+        const isWin = (updated.realizedPnlUsdc ?? 0) > 0;
+        await this.targetModel
+          .updateOne(
+            { address: updated.targetAddress.toLowerCase() },
+            {
+              $inc: {
+                "stats.realizedPnlUsdc": updated.realizedPnlUsdc ?? 0,
+                ...(isWin ? { "stats.wonTrades": 1 } : { "stats.lostTrades": 1 }),
+              },
+            }
+          )
+          .catch((e) =>
+            console.warn("[PositionsService] Erreur mise à jour stats cible sur SELL:", e)
+          );
+      }
 
       // Notification Discord enrichie (une seule fois garantie)
       const mapped = this.mapToPosition(updated.toObject());

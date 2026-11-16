@@ -129,6 +129,10 @@ export class TradesService {
           $set: {
             "stats.totalCopiedTrades": 0,
             "stats.totalCopiedVolumeUsdc": 0,
+            "stats.realizedPnlUsdc": 0,
+            "stats.winRatePercent": 0,
+            "stats.wonTrades": 0,
+            "stats.lostTrades": 0,
           },
         }
       )
