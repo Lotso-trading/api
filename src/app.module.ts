@@ -9,15 +9,15 @@ import { TargetsModule } from "./modules/targets/targets.module.ts";
 import { TradesModule } from "./modules/trades/trades.module.ts";
 
 @Module({
-  imports: [
-    DatabaseModule,
-    NotificationsModule,
-    EventsModule,
-    TargetsModule,
-    TradesModule,
-    PositionsModule,
-    ConfigModule,
-    MetricsModule,
-  ],
+    imports: [
+        DatabaseModule,
+        NotificationsModule,
+        EventsModule,
+        TargetsModule,
+        TradesModule,
+        PositionsModule,
+        ConfigModule,
+        MetricsModule,
+    ],
 })
 export class AppModule {}

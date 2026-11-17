@@ -6,14 +6,14 @@ import { PositionsController } from "./positions.controller.ts";
 import { PositionsService } from "./positions.service.ts";
 
 @Module({
-  imports: [
-    MongooseModule.forFeature([
-      { name: PositionModel.name, schema: PositionSchema },
-      { name: TargetModel.name, schema: TargetSchema },
-    ]),
-  ],
-  controllers: [PositionsController],
-  providers: [PositionsService],
-  exports: [PositionsService],
+    imports: [
+        MongooseModule.forFeature([
+            { name: PositionModel.name, schema: PositionSchema },
+            { name: TargetModel.name, schema: TargetSchema },
+        ]),
+    ],
+    controllers: [PositionsController],
+    providers: [PositionsService],
+    exports: [PositionsService],
 })
 export class PositionsModule {}

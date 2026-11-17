@@ -7,15 +7,15 @@ import { TradesController } from "./trades.controller.ts";
 import { TradesService } from "./trades.service.ts";
 
 @Module({
-  imports: [
-    MongooseModule.forFeature([
-      { name: TradeModel.name, schema: TradeSchema },
-      { name: TargetModel.name, schema: TargetSchema },
-    ]),
-    PositionsModule,
-  ],
-  controllers: [TradesController],
-  providers: [TradesService],
-  exports: [TradesService],
+    imports: [
+        MongooseModule.forFeature([
+            { name: TradeModel.name, schema: TradeSchema },
+            { name: TargetModel.name, schema: TargetSchema },
+        ]),
+        PositionsModule,
+    ],
+    controllers: [TradesController],
+    providers: [TradesService],
+    exports: [TradesService],
 })
 export class TradesModule {}
