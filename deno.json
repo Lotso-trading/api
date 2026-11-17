@@ -25,6 +25,9 @@
   "tasks": {
     "dev": "deno run -A --unsafe-proto --watch src/main.ts",
     "start": "deno run -A --unsafe-proto src/main.ts",
-    "test": "deno test -A --unsafe-proto tests/"
+    "test": "deno test -A --unsafe-proto tests/",
+    "lint": "deno run -A npm:@biomejs/biome check .",
+    "format": "deno run -A npm:@biomejs/biome format --write .",
+    "check": "deno check src/main.ts"
   }
 }

@@ -579,10 +579,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             updateFields.eventSlug = resolved.eventSlug;
           }
           if (Object.keys(updateFields).length > 0) {
-            await this.positionModel.updateOne(
-              { _id: doc._id },
-              { $set: updateFields }
-            );
+            await this.positionModel.updateOne({ _id: doc._id }, { $set: updateFields });
           }
         }
       })
@@ -618,10 +615,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             updateFields.eventSlug = resolved.eventSlug;
           }
           if (Object.keys(updateFields).length > 0) {
-            await this.positionModel.updateOne(
-              { _id: doc._id },
-              { $set: updateFields }
-            );
+            await this.positionModel.updateOne({ _id: doc._id }, { $set: updateFields });
           }
         }
       })
@@ -775,10 +769,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             updateFields.eventSlug = resolved.eventSlug;
           }
           if (Object.keys(updateFields).length > 0) {
-            await this.positionModel.updateOne(
-              { _id: doc._id },
-              { $set: updateFields }
-            );
+            await this.positionModel.updateOne({ _id: doc._id }, { $set: updateFields });
           }
         }
       })
@@ -926,7 +917,10 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         if (!existing.endDate && (marketInfo?.endDate || resolved.endDate)) {
           existing.endDate = marketInfo?.endDate || resolved.endDate;
         }
-        if (!existing.eventSlug && (marketInfo?.eventSlug || trade.eventSlug || resolved.eventSlug)) {
+        if (
+          !existing.eventSlug &&
+          (marketInfo?.eventSlug || trade.eventSlug || resolved.eventSlug)
+        ) {
           existing.eventSlug = marketInfo?.eventSlug || trade.eventSlug || resolved.eventSlug;
         }
       }

@@ -191,8 +191,12 @@ export class TargetsService {
     const stats: TargetTrader["stats"] = {
       totalCopiedTrades: Number(baseStats.totalCopiedTrades || 0),
       totalCopiedVolumeUsdc: Number(baseStats.totalCopiedVolumeUsdc || 0),
-      realizedPnlUsdc: aggregatedStats ? aggregatedStats.realizedPnlUsdc : Number(baseStats.realizedPnlUsdc || 0),
-      winRatePercent: aggregatedStats ? aggregatedStats.winRatePercent : Number(baseStats.winRatePercent || 0),
+      realizedPnlUsdc: aggregatedStats
+        ? aggregatedStats.realizedPnlUsdc
+        : Number(baseStats.realizedPnlUsdc || 0),
+      winRatePercent: aggregatedStats
+        ? aggregatedStats.winRatePercent
+        : Number(baseStats.winRatePercent || 0),
       wonTrades: aggregatedStats?.wonTrades ?? Number(baseStats.wonTrades || 0),
       lostTrades: aggregatedStats?.lostTrades ?? Number(baseStats.lostTrades || 0),
     };

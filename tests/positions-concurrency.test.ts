@@ -188,6 +188,7 @@ Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pa
       assertEquals(Array.isArray(pipeline), true);
       return Promise.resolve(mockAggregationResult);
     },
+    updateOne: () => Promise.resolve({ modifiedCount: 1 }),
   };
 
   const service = new PositionsService(
@@ -347,6 +348,7 @@ Deno.test("PositionsService - resolveMarketEndDate résout la date via Gamma API
             {
               endDate: "2026-11-20T18:00:00Z",
               endDateIso: "2026-11-20T18:00:00Z",
+              events: [{ slug: "test-event" }],
             },
           ]),
           { status: 200 }
