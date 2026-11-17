@@ -3,7 +3,7 @@
     "version": "1.0.0",
     "exports": "./src/main.ts",
     "imports": {
-        "@lotso-trading/shared": "npm:@lotso-trading/shared@1.0.0-develop.4",
+        "@lotso-trading/shared": "npm:@lotso-trading/shared@1.0.0",
         "@nestjs/common": "npm:@nestjs/common@^12.5.1",
         "@nestjs/core": "npm:@nestjs/core@^12.5.1",
         "@nestjs/platform-express": "npm:@nestjs/platform-express@^12.5.1",
