@@ -341,11 +341,12 @@ Deno.test("PositionsService - resolveMarketEndDate résout la date via Gamma API
             return Promise.resolve(new Response("Not Found", { status: 404 }));
         }
         // 2. Gamma réussit
-        if (urlStr.includes("gamma-api.polymarket.com/markets?condition_id=")) {
+        if (urlStr.includes("gamma-api.polymarket.com/markets?condition_ids=")) {
             return Promise.resolve(
                 new Response(
                     JSON.stringify([
                         {
+                            conditionId: mockConditionId,
                             endDate: "2026-11-20T18:00:00Z",
                             endDateIso: "2026-11-20T18:00:00Z",
                             events: [{ slug: "test-event" }],
@@ -433,6 +434,7 @@ Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API qua
                 new Response(
                     JSON.stringify([
                         {
+                            conditionId: mockConditionId,
                             closed: true,
                             endDate: "2026-11-15T20:00:00Z",
                             outcomes: JSON.stringify(["France", "Brazil"]),
@@ -464,4 +466,80 @@ Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API qua
     } finally {
         globalThis.fetch = originalFetch;
     }
+});
+
+Deno.test("PositionsService - resolveMarketMetadata ignore un premier résultat Gamma non correspondant", async () => {
+    const originalFetch = globalThis.fetch;
+    const targetConditionId = "0x8a42bb4cb9b9f157b539611f6a8c122388f652570cfc3c07d538e7df2bb78894";
+    let gammaQueriedUrl = "";
+
+    globalThis.fetch = ((url: string | URL | Request) => {
+        const urlStr = String(url);
+        if (urlStr.includes("clob.polymarket.com")) {
+            return Promise.resolve(new Response("Not Found", { status: 404 }));
+        }
+        if (urlStr.includes("gamma-api.polymarket.com")) {
+            gammaQueriedUrl = urlStr;
+            return Promise.resolve(
+                new Response(
+                    JSON.stringify([
+                        {
+                            conditionId: "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+                            slug: "xi-jinping-out-before-2027",
+                            events: [{ slug: "xi-jinping-out-before-2027" }],
+                        },
+                        {
+                            conditionId: targetConditionId,
+                            slug: "will-ulf-kristersson-be-the-next-prime-minister-of-sweden",
+                            endDate: "2026-09-14T03:59:00Z",
+                            events: [{ slug: "next-prime-minister-of-sweden" }],
+                        },
+                    ]),
+                    { status: 200 }
+                )
+            );
+        }
+        return Promise.resolve(new Response("{}", { status: 404 }));
+    }) as typeof fetch;
+
+    try {
+        const service = new PositionsService(
+            {} as unknown as Model<PositionDocument>,
+            {} as unknown as Model<TargetDocument>,
+            { broadcast: () => {} } as unknown as EventsGateway,
+            {} as unknown as DiscordNotifierService
+        );
+
+        const meta = await service.resolveMarketMetadata(targetConditionId);
+        assertEquals(gammaQueriedUrl.includes("condition_ids="), true);
+        assertEquals(meta.eventSlug, "next-prime-minister-of-sweden");
+        assertEquals(meta.endDate, "2026-09-14T03:59:00Z");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+Deno.test("PositionsService - sanitizeCorruptedEventSlugs supprime xi-jinping-out-before-2027 sur les marchés non Xi", async () => {
+    let updateFilter: unknown = null;
+    let updateOp: unknown = null;
+
+    const mockPositionModel = {
+        updateMany: (filter: unknown, update: unknown) => {
+            updateFilter = filter;
+            updateOp = update;
+            return Promise.resolve({ modifiedCount: 3 });
+        },
+    };
+
+    const service = new PositionsService(
+        mockPositionModel as unknown as Model<PositionDocument>,
+        {} as unknown as Model<TargetDocument>,
+        { broadcast: () => {} } as unknown as EventsGateway,
+        {} as unknown as DiscordNotifierService
+    );
+
+    const count = await service.sanitizeCorruptedEventSlugs();
+    assertEquals(count, 3);
+    assertEquals((updateFilter as { eventSlug: string }).eventSlug, "xi-jinping-out-before-2027");
+    assertEquals((updateOp as { $unset: { eventSlug: string } }).$unset.eventSlug, "");
 });

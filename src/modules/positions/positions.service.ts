@@ -43,16 +43,39 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             });
         }, 60_000);
 
-        // Lancement en tâche de fond de la rétro-résolution des métadonnées manquantes (dates, eventSlug)
-        this.backfillMissingMetadata().catch((err: unknown) => {
-            console.warn("[PositionsService] Erreur backfill metadata:", err);
-        });
+        // Lancement en tâche de fond de l'assainissement et de la rétro-résolution des métadonnées (dates, eventSlug)
+        this.sanitizeCorruptedEventSlugs()
+            .then(() => this.backfillMissingMetadata())
+            .catch((err: unknown) => {
+                console.warn("[PositionsService] Erreur assainissement/backfill metadata:", err);
+            });
     }
 
     onModuleDestroy(): void {
         if (this.autoSettleIntervalId !== null) {
             clearInterval(this.autoSettleIntervalId);
             this.autoSettleIntervalId = null;
+        }
+    }
+
+    async sanitizeCorruptedEventSlugs(): Promise<number> {
+        try {
+            const cleanupResult = await this.positionModel.updateMany(
+                {
+                    eventSlug: "xi-jinping-out-before-2027",
+                    marketSlug: { $ne: "xi-jinping-out-before-2027" },
+                },
+                { $unset: { eventSlug: "" } }
+            );
+            if (cleanupResult.modifiedCount > 0) {
+                console.log(
+                    `[PositionsService] 🧹 ${cleanupResult.modifiedCount} position(s) avec eventSlug corrompu nettoyée(s).`
+                );
+            }
+            return cleanupResult.modifiedCount;
+        } catch (err: unknown) {
+            console.warn("[PositionsService] Erreur nettoyage eventSlug corrompu:", err);
+            return 0;
         }
     }
 
@@ -67,6 +90,10 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         { eventSlug: { $exists: false } },
                         { eventSlug: "" },
                         { eventSlug: null },
+                        {
+                            eventSlug: "xi-jinping-out-before-2027",
+                            marketSlug: { $ne: "xi-jinping-out-before-2027" },
+                        },
                     ],
                     conditionId: { $ne: "0x" },
                 })
@@ -91,7 +118,10 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                     pos.endDate = resolved.endDate;
                     updateFields.endDate = resolved.endDate;
                 }
-                if (resolved.eventSlug && !pos.eventSlug) {
+                const isCorruptedSlug =
+                    pos.eventSlug === "xi-jinping-out-before-2027" &&
+                    pos.marketSlug !== "xi-jinping-out-before-2027";
+                if (resolved.eventSlug && (!pos.eventSlug || isCorruptedSlug)) {
                     pos.eventSlug = resolved.eventSlug;
                     updateFields.eventSlug = resolved.eventSlug;
                 }
@@ -171,26 +201,37 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             // Poursuite vers Gamma
         }
 
-        // 2. Appel Gamma API par condition_id
+        // 2. Appel Gamma API par condition_ids
         if (isHexConditionId) {
             try {
                 const res = await fetch(
-                    `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`,
+                    `https://gamma-api.polymarket.com/markets?condition_ids=${conditionId}`,
                     { signal: AbortSignal.timeout(5000) }
                 );
                 if (res.ok) {
                     const list = (await res.json()) as Array<{
+                        conditionId?: string;
                         endDate?: string;
                         endDateIso?: string;
                         game_start_time?: string;
                         events?: Array<{ slug?: string }>;
                     }>;
-                    if (!resolvedDate) {
-                        resolvedDate =
-                            list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
-                    }
-                    if (!resolvedEventSlug) {
-                        resolvedEventSlug = list[0]?.events?.[0]?.slug;
+                    const matchedMarket = Array.isArray(list)
+                        ? list.find(
+                              (m) =>
+                                  m?.conditionId?.toLowerCase() === conditionId.toLowerCase()
+                          )
+                        : undefined;
+                    if (matchedMarket) {
+                        if (!resolvedDate) {
+                            resolvedDate =
+                                matchedMarket.endDate ||
+                                matchedMarket.endDateIso ||
+                                matchedMarket.game_start_time;
+                        }
+                        if (!resolvedEventSlug) {
+                            resolvedEventSlug = matchedMarket.events?.[0]?.slug;
+                        }
                     }
                 }
             } catch (_err: unknown) {
@@ -213,17 +254,43 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                 );
                 if (res.ok) {
                     const list = (await res.json()) as Array<{
+                        conditionId?: string;
+                        clobTokenIds?: string[] | string;
                         endDate?: string;
                         endDateIso?: string;
                         game_start_time?: string;
                         events?: Array<{ slug?: string }>;
                     }>;
-                    if (!resolvedDate) {
-                        resolvedDate =
-                            list[0]?.endDate || list[0]?.endDateIso || list[0]?.game_start_time;
-                    }
-                    if (!resolvedEventSlug) {
-                        resolvedEventSlug = list[0]?.events?.[0]?.slug;
+                    const matchedMarket = Array.isArray(list)
+                        ? list.find((m) => {
+                              if (!m) return false;
+                              if (
+                                  m.conditionId &&
+                                  conditionId &&
+                                  m.conditionId.toLowerCase() === conditionId.toLowerCase()
+                              ) {
+                                  return true;
+                              }
+                              if (m.clobTokenIds) {
+                                  const ids =
+                                      typeof m.clobTokenIds === "string"
+                                          ? JSON.parse(m.clobTokenIds)
+                                          : m.clobTokenIds;
+                                  return Array.isArray(ids) && ids.includes(effectiveTokenId);
+                              }
+                              return true;
+                          })
+                        : undefined;
+                    if (matchedMarket) {
+                        if (!resolvedDate) {
+                            resolvedDate =
+                                matchedMarket.endDate ||
+                                matchedMarket.endDateIso ||
+                                matchedMarket.game_start_time;
+                        }
+                        if (!resolvedEventSlug) {
+                            resolvedEventSlug = matchedMarket.events?.[0]?.slug;
+                        }
                     }
                 }
             } catch (_err: unknown) {
@@ -404,7 +471,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                           : null;
 
                     const gammaUrl = isHexConditionId
-                        ? `https://gamma-api.polymarket.com/markets?condition_id=${pos.conditionId}`
+                        ? `https://gamma-api.polymarket.com/markets?condition_ids=${pos.conditionId}`
                         : effectiveTokenId
                           ? `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`
                           : pos.marketSlug &&
@@ -417,6 +484,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         const res = await fetch(gammaUrl, { signal: AbortSignal.timeout(4000) });
                         if (res.ok) {
                             const list = (await res.json()) as Array<{
+                                conditionId?: string;
                                 closed?: boolean;
                                 endDate?: string;
                                 endDateIso?: string;
@@ -425,13 +493,26 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                                 outcomePrices?: string[] | string;
                                 outcomes?: string[] | string;
                             }>;
-                            const market = list[0];
+                            const market = isHexConditionId
+                                ? Array.isArray(list)
+                                    ? list.find(
+                                          (m) =>
+                                              m?.conditionId?.toLowerCase() ===
+                                              pos.conditionId.toLowerCase()
+                                      )
+                                    : undefined
+                                : Array.isArray(list)
+                                  ? list[0]
+                                  : undefined;
                             if (market) {
                                 if (!resolvedMarketDate) {
                                     resolvedMarketDate = market.endDate || market.endDateIso;
                                 }
                                 const resolvedEventSlug = market.events?.[0]?.slug;
-                                if (!pos.eventSlug && resolvedEventSlug) {
+                                const isCorruptedSlug =
+                                    pos.eventSlug === "xi-jinping-out-before-2027" &&
+                                    pos.marketSlug !== "xi-jinping-out-before-2027";
+                                if ((!pos.eventSlug || isCorruptedSlug) && resolvedEventSlug) {
                                     pos.eventSlug = resolvedEventSlug;
                                     await this.positionModel.updateOne(
                                         { _id: pos._id },
@@ -587,8 +668,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         // Résolution paresseuse des métadonnées manquantes (dates, eventSlug)
         await Promise.all(
             docs.map(async (doc) => {
+                const isCorruptedSlug =
+                    doc.eventSlug === "xi-jinping-out-before-2027" &&
+                    doc.marketSlug !== "xi-jinping-out-before-2027";
                 if (
-                    (!doc.endDate || !doc.eventSlug) &&
+                    (!doc.endDate || !doc.eventSlug || isCorruptedSlug) &&
                     doc.conditionId &&
                     doc.conditionId !== "0x"
                 ) {
@@ -602,7 +686,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         doc.endDate = resolved.endDate;
                         updateFields.endDate = resolved.endDate;
                     }
-                    if (resolved.eventSlug && !doc.eventSlug) {
+                    if (resolved.eventSlug && (!doc.eventSlug || isCorruptedSlug)) {
                         doc.eventSlug = resolved.eventSlug;
                         updateFields.eventSlug = resolved.eventSlug;
                     }
@@ -630,8 +714,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         // Résolution paresseuse des métadonnées manquantes sur les positions clôturées
         await Promise.all(
             docs.map(async (doc) => {
+                const isCorruptedSlug =
+                    doc.eventSlug === "xi-jinping-out-before-2027" &&
+                    doc.marketSlug !== "xi-jinping-out-before-2027";
                 if (
-                    (!doc.endDate || !doc.eventSlug) &&
+                    (!doc.endDate || !doc.eventSlug || isCorruptedSlug) &&
                     doc.conditionId &&
                     doc.conditionId !== "0x"
                 ) {
@@ -645,7 +732,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         doc.endDate = resolved.endDate;
                         updateFields.endDate = resolved.endDate;
                     }
-                    if (resolved.eventSlug && !doc.eventSlug) {
+                    if (resolved.eventSlug && (!doc.eventSlug || isCorruptedSlug)) {
                         doc.eventSlug = resolved.eventSlug;
                         updateFields.eventSlug = resolved.eventSlug;
                     }
@@ -807,8 +894,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         // Résolution paresseuse des métadonnées manquantes sur les items paginés
         await Promise.all(
             rawItems.map(async (doc) => {
+                const isCorruptedSlug =
+                    doc.eventSlug === "xi-jinping-out-before-2027" &&
+                    doc.marketSlug !== "xi-jinping-out-before-2027";
                 if (
-                    (!doc.endDate || !doc.eventSlug) &&
+                    (!doc.endDate || !doc.eventSlug || isCorruptedSlug) &&
                     doc.conditionId &&
                     doc.conditionId !== "0x"
                 ) {
@@ -822,7 +912,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         doc.endDate = resolved.endDate;
                         updateFields.endDate = resolved.endDate;
                     }
-                    if (resolved.eventSlug && !doc.eventSlug) {
+                    if (resolved.eventSlug && (!doc.eventSlug || isCorruptedSlug)) {
                         doc.eventSlug = resolved.eventSlug;
                         updateFields.eventSlug = resolved.eventSlug;
                     }
@@ -970,7 +1060,10 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             existing.unrealizedPnlPercent =
                 newTotalInvested > 0 ? (existing.unrealizedPnlUsdc / newTotalInvested) * 100 : 0;
             existing.updatedAt = trade.executedAt;
-            if (!existing.endDate || !existing.eventSlug) {
+            const isCorruptedExistingSlug =
+                existing.eventSlug === "xi-jinping-out-before-2027" &&
+                (marketInfo?.marketSlug || existing.marketSlug) !== "xi-jinping-out-before-2027";
+            if (!existing.endDate || !existing.eventSlug || isCorruptedExistingSlug) {
                 const resolved = await this.resolveMarketMetadata(
                     trade.conditionId,
                     marketInfo?.marketSlug,
@@ -980,7 +1073,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                     existing.endDate = marketInfo?.endDate || resolved.endDate;
                 }
                 if (
-                    !existing.eventSlug &&
+                    (!existing.eventSlug || isCorruptedExistingSlug) &&
                     (marketInfo?.eventSlug || trade.eventSlug || resolved.eventSlug)
                 ) {
                     existing.eventSlug =
