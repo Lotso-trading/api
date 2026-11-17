@@ -6,7 +6,7 @@
 - Built on **NestJS 12**, Deno 2 runtime, and **MongoDB** (Mongoose).
 - Exposes RESTful endpoints for the Vue 3 dashboard and background scripts.
 - Hosts a high-performance **WebSocket Gateway** broadcasting real-time trade events (detected, validated, executed, rejected).
-- Connects to `@polymarket-copy/shared` for all data contracts, schemas, and Discord embed formatting.
+- Connects to `@lotso-trading/shared` for all data contracts, schemas, and Discord embed formatting.
 
 ---
 

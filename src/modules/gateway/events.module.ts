@@ -3,7 +3,7 @@ import { EventsGateway } from "./events.gateway.ts";
 
 @Global()
 @Module({
-  providers: [EventsGateway],
-  exports: [EventsGateway],
+    providers: [EventsGateway],
+    exports: [EventsGateway],
 })
 export class EventsModule {}

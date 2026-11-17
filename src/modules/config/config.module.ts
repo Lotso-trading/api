@@ -6,12 +6,12 @@ import { ConfigController } from "./config.controller.ts";
 import { BotConfigService } from "./config.service.ts";
 
 @Module({
-  imports: [
-    MongooseModule.forFeature([{ name: ConfigModel.name, schema: ConfigSchema }]),
-    MetricsModule,
-  ],
-  controllers: [ConfigController],
-  providers: [BotConfigService],
-  exports: [BotConfigService],
+    imports: [
+        MongooseModule.forFeature([{ name: ConfigModel.name, schema: ConfigSchema }]),
+        MetricsModule,
+    ],
+    controllers: [ConfigController],
+    providers: [BotConfigService],
+    exports: [BotConfigService],
 })
 export class ConfigModule {}

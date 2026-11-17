@@ -8,16 +8,16 @@ import { MetricsController } from "./metrics.controller.ts";
 import { MetricsService } from "./metrics.service.ts";
 
 @Module({
-  imports: [
-    MongooseModule.forFeature([
-      { name: TradeModel.name, schema: TradeSchema },
-      { name: PositionModel.name, schema: PositionSchema },
-      { name: TargetModel.name, schema: TargetSchema },
-      { name: ConfigModel.name, schema: ConfigSchema },
-    ]),
-  ],
-  controllers: [MetricsController],
-  providers: [MetricsService],
-  exports: [MetricsService],
+    imports: [
+        MongooseModule.forFeature([
+            { name: TradeModel.name, schema: TradeSchema },
+            { name: PositionModel.name, schema: PositionSchema },
+            { name: TargetModel.name, schema: TargetSchema },
+            { name: ConfigModel.name, schema: ConfigSchema },
+        ]),
+    ],
+    controllers: [MetricsController],
+    providers: [MetricsService],
+    exports: [MetricsService],
 })
 export class MetricsModule {}
