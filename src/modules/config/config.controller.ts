@@ -53,8 +53,8 @@ export class ConfigController {
     }
 
     @Post("heartbeat")
-    async heartbeat(): Promise<{ success: boolean }> {
-        await this.configService.recordHeartbeat();
+    async heartbeat(@Body() body?: { version?: string }): Promise<{ success: boolean }> {
+        await this.configService.recordHeartbeat(body?.version);
         return { success: true };
     }
 

@@ -1,11 +1,24 @@
-import type { ExecutedTrade, PaginationQuery } from "@lotso-trading/shared";
+import type { ExecutedTrade, TradesQuery } from "@lotso-trading/shared";
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
+import {
+    buildPaginatedResponse,
+    escapeRegex,
+    normalizePagination,
+} from "../../common/utils/pagination.util.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
 import { type TradeDocument, TradeModel } from "../../database/schemas/trade.schema.ts";
 import { EventsGateway } from "../gateway/events.gateway.ts";
 import { PositionsService } from "../positions/positions.service.ts";
+
+const ALLOWED_SORT_FIELDS: Record<TradesQuery["sortBy"], string> = {
+    executedAt: "executedAt",
+    costUsdc: "costUsdc",
+    shares: "shares",
+    executedPrice: "executedPrice",
+    slippagePercent: "slippagePercent",
+};
 
 @Injectable()
 export class TradesService {
@@ -18,35 +31,53 @@ export class TradesService {
         private readonly eventsGateway: EventsGateway
     ) {}
 
-    async findAll(query: PaginationQuery): Promise<{
+    async findAll(query: TradesQuery): Promise<{
         items: ExecutedTrade[];
         total: number;
         page: number;
         limit: number;
+        totalPages: number;
     }> {
         const filter: Record<string, unknown> = {};
         if (query.status) filter.status = query.status;
         if (query.targetAddress) filter.targetAddress = query.targetAddress.toLowerCase();
         if (query.side) filter.side = query.side;
 
-        const skip = (query.page - 1) * query.limit;
+        if (query.isDryRun === "DRY_RUN") {
+            filter.isDryRun = true;
+        } else if (query.isDryRun === "LIVE") {
+            filter.isDryRun = false;
+        }
+
+        if (query.search && query.search.trim().length > 0) {
+            const regex = new RegExp(escapeRegex(query.search.trim()), "i");
+            filter.$or = [
+                { marketQuestion: regex },
+                { marketSlug: regex },
+                { outcomeLabel: regex },
+                { rejectionReason: regex },
+            ];
+        }
+
+        const { page, limit, skip } = normalizePagination(query.page, query.limit, 20, 100);
+        const sortField = ALLOWED_SORT_FIELDS[query.sortBy] ?? "executedAt";
+        const sortDirection = query.sortOrder === "asc" ? 1 : -1;
+        const sortSpec: Record<string, 1 | -1> =
+            sortField === "executedAt"
+                ? { executedAt: sortDirection }
+                : { [sortField]: sortDirection, executedAt: -1 };
+
         const [docs, total] = await Promise.all([
-            this.tradeModel
-                .find(filter)
-                .sort({ executedAt: -1 })
-                .skip(skip)
-                .limit(query.limit)
-                .lean()
-                .exec(),
+            this.tradeModel.find(filter).sort(sortSpec).skip(skip).limit(limit).lean().exec(),
             this.tradeModel.countDocuments(filter).exec(),
         ]);
 
-        return {
-            items: docs.map((doc) => this.mapToExecutedTrade(doc)),
+        return buildPaginatedResponse(
+            docs.map((doc) => this.mapToExecutedTrade(doc)),
             total,
-            page: query.page,
-            limit: query.limit,
-        };
+            page,
+            limit
+        );
     }
 
     async recordTrade(trade: ExecutedTrade): Promise<ExecutedTrade> {

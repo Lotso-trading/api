@@ -7,14 +7,34 @@ export class EventsGateway implements OnModuleInit, OnModuleDestroy {
     private wss: WebSocketServer | null = null;
     private readonly port = Number(Deno.env.get("WS_PORT")) || 3001;
     private readonly botSockets = new Set<WebSocket>();
-    private botPresenceListener: ((isOnline: boolean) => void) | null = null;
+    private readonly botPresenceListeners = new Set<(isOnline: boolean) => void>();
+    private readonly botVersionListeners = new Set<(version: string | null) => void>();
+    private botVersion: string | null = null;
 
     onBotPresenceChange(listener: (isOnline: boolean) => void): void {
-        this.botPresenceListener = listener;
+        this.botPresenceListeners.add(listener);
+    }
+
+    onBotVersionChange(listener: (version: string | null) => void): void {
+        this.botVersionListeners.add(listener);
     }
 
     isBotConnected(): boolean {
         return this.botSockets.size > 0;
+    }
+
+    getBotVersion(): string | null {
+        return this.botVersion;
+    }
+
+    setBotVersion(version: string | null): void {
+        const normalized = version?.trim() || null;
+        if (this.botVersion !== normalized) {
+            this.botVersion = normalized;
+            for (const listener of this.botVersionListeners) {
+                listener(this.botVersion);
+            }
+        }
     }
 
     onModuleInit(): void {
@@ -27,15 +47,26 @@ export class EventsGateway implements OnModuleInit, OnModuleDestroy {
 
                 const url = new URL(req.url || "", `http://localhost:${this.port}`);
                 const isBotByUrl = url.searchParams.get("role") === "bot";
+                const versionFromUrl = url.searchParams.get("version");
 
                 if (isBotByUrl) {
+                    if (versionFromUrl) {
+                        this.setBotVersion(versionFromUrl);
+                    }
                     this.registerBotSocket(socket);
                 }
 
                 socket.on("message", (raw: unknown) => {
                     try {
-                        const data = JSON.parse(String(raw)) as { event?: string; role?: string };
+                        const data = JSON.parse(String(raw)) as {
+                            event?: string;
+                            role?: string;
+                            version?: string;
+                        };
                         if (data?.event === "bot:identify" || data?.role === "bot") {
+                            if (typeof data.version === "string" && data.version.trim()) {
+                                this.setBotVersion(data.version);
+                            }
                             this.registerBotSocket(socket);
                         }
                     } catch (_err: unknown) {
@@ -64,7 +95,9 @@ export class EventsGateway implements OnModuleInit, OnModuleDestroy {
                 `[EventsGateway] Bot connecté via WebSocket (actifs: ${this.botSockets.size})`
             );
             if (wasEmpty) {
-                this.botPresenceListener?.(true);
+                for (const listener of this.botPresenceListeners) {
+                    listener(true);
+                }
             }
         }
     }
@@ -76,7 +109,9 @@ export class EventsGateway implements OnModuleInit, OnModuleDestroy {
                 `[EventsGateway] Bot déconnecté du WebSocket (actifs: ${this.botSockets.size})`
             );
             if (this.botSockets.size === 0) {
-                this.botPresenceListener?.(false);
+                for (const listener of this.botPresenceListeners) {
+                    listener(false);
+                }
             }
         }
     }
@@ -86,6 +121,19 @@ export class EventsGateway implements OnModuleInit, OnModuleDestroy {
             this.wss.close();
             this.wss = null;
         }
+    }
+
+    sendToBots(event: string, payload: unknown): boolean {
+        if (this.botSockets.size === 0) return false;
+        const message = JSON.stringify({ event, data: payload, timestamp: Date.now() });
+        let sentCount = 0;
+        for (const client of this.botSockets) {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(message);
+                sentCount++;
+            }
+        }
+        return sentCount > 0;
     }
 
     broadcast(event: string, payload: unknown): void {

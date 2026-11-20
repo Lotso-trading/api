@@ -1,27 +1,33 @@
-import type { ClosedPositionsQuery, ExecutedTrade, OpenPosition } from "@lotso-trading/shared";
-import {
-    Injectable,
-    NotFoundException,
-    type OnModuleDestroy,
-    type OnModuleInit,
-} from "@nestjs/common";
+import type {
+    ClosedPositionsQuery,
+    ClosedPositionsTotals,
+    ClosePositionInput,
+    ExecutedTrade,
+    OpenPosition,
+    SyncRequestResponse,
+} from "@lotso-trading/shared";
+import { Injectable, NotFoundException, type OnModuleInit, Optional } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
+import { PolymarketMetadataService } from "../../common/services/polymarket-metadata.service.ts";
+import { findByIdOrThrow } from "../../common/utils/entity-lookup.util.ts";
+import { buildPaginatedResponse, normalizePagination } from "../../common/utils/pagination.util.ts";
+import {
+    buildTimestampMsExpr,
+    CLOSED_LOSS_MATCH,
+    CLOSED_POSITION_STATS_ACCUMULATORS,
+    CLOSED_WIN_MATCH,
+    formatClosedPositionsTotals,
+    type RawClosedStatsDoc,
+} from "../../common/utils/position-stats.util.ts";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
 import { EventsGateway } from "../gateway/events.gateway.ts";
 import { DiscordNotifierService } from "../notifications/discord-notifier.service.ts";
 
 @Injectable()
-export class PositionsService implements OnModuleInit, OnModuleDestroy {
-    private readonly marketEndDateCache = new Map<
-        string,
-        { date: string; eventSlug?: string; timestamp: number }
-    >();
-    private settlePromise: Promise<number> | null = null;
-    private lastAutoSettleTimestamp = 0;
-    private readonly autoSettleThrottleMs = 30_000; // Throttling 30s entre deux vérifications automatiques
-    private autoSettleIntervalId: ReturnType<typeof setInterval> | null = null;
+export class PositionsService implements OnModuleInit {
+    private readonly metadataService: PolymarketMetadataService;
 
     constructor(
         @InjectModel(PositionModel.name)
@@ -29,117 +35,49 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         @InjectModel(TargetModel.name)
         private readonly targetModel: Model<TargetDocument>,
         private readonly eventsGateway: EventsGateway,
-        private readonly discordNotifier: DiscordNotifierService
-    ) {}
+        private readonly discordNotifier: DiscordNotifierService,
+        @Optional() metadataService?: PolymarketMetadataService
+    ) {
+        this.metadataService = metadataService ?? new PolymarketMetadataService();
+    }
 
     onModuleInit(): void {
-        // Vérification périodique de résolution automatique toutes les 60s en arrière-plan
-        this.autoSettleIntervalId = setInterval(() => {
-            this.settleResolvedPositions(false).catch((err: unknown) => {
-                console.warn(
-                    "[PositionsService] Erreur lors de la vérification de settlement automatique:",
-                    err
-                );
-            });
-        }, 60_000);
-
-        // Lancement en tâche de fond de l'assainissement et de la rétro-résolution des métadonnées (dates, eventSlug)
-        this.sanitizeCorruptedEventSlugs()
-            .then(() => this.backfillMissingMetadata())
+        // Assainissement et rétro-résolution des métadonnées (dates, eventSlug) au démarrage uniquement.
+        // La vérification des marchés clôturés/résolus est exclusivement de la responsabilité du service Bot.
+        this.metadataService
+            .sanitizeCorruptedEventSlugs(this.positionModel)
+            .then(() => this.metadataService.backfillMissingMetadata(this.positionModel))
             .catch((err: unknown) => {
                 console.warn("[PositionsService] Erreur assainissement/backfill metadata:", err);
             });
     }
 
-    onModuleDestroy(): void {
-        if (this.autoSettleIntervalId !== null) {
-            clearInterval(this.autoSettleIntervalId);
-            this.autoSettleIntervalId = null;
-        }
-    }
-
     async sanitizeCorruptedEventSlugs(): Promise<number> {
-        try {
-            const cleanupResult = await this.positionModel.updateMany(
-                {
-                    eventSlug: "xi-jinping-out-before-2027",
-                    marketSlug: { $ne: "xi-jinping-out-before-2027" },
-                },
-                { $unset: { eventSlug: "" } }
-            );
-            if (cleanupResult.modifiedCount > 0) {
-                console.log(
-                    `[PositionsService] 🧹 ${cleanupResult.modifiedCount} position(s) avec eventSlug corrompu nettoyée(s).`
-                );
-            }
-            return cleanupResult.modifiedCount;
-        } catch (err: unknown) {
-            console.warn("[PositionsService] Erreur nettoyage eventSlug corrompu:", err);
-            return 0;
-        }
+        return await this.metadataService.sanitizeCorruptedEventSlugs(this.positionModel);
     }
 
-    private async backfillMissingMetadata(): Promise<void> {
-        try {
-            const positionsToBackfill = await this.positionModel
-                .find({
-                    $or: [
-                        { endDate: { $exists: false } },
-                        { endDate: "" },
-                        { endDate: null },
-                        { eventSlug: { $exists: false } },
-                        { eventSlug: "" },
-                        { eventSlug: null },
-                        {
-                            eventSlug: "xi-jinping-out-before-2027",
-                            marketSlug: { $ne: "xi-jinping-out-before-2027" },
-                        },
-                    ],
-                    conditionId: { $ne: "0x" },
-                })
-                .limit(200)
-                .exec();
+    async resolveMarketMetadata(
+        conditionId: string,
+        marketSlug?: string,
+        assetAddress?: string
+    ): Promise<{ endDate?: string; eventSlug?: string }> {
+        return await this.metadataService.resolveMarketMetadata(
+            conditionId,
+            marketSlug,
+            assetAddress
+        );
+    }
 
-            if (positionsToBackfill.length === 0) return;
-
-            console.log(
-                `[PositionsService] 🔄 Début de la rétro-résolution des métadonnées pour ${positionsToBackfill.length} position(s)...`
-            );
-
-            let resolvedCount = 0;
-            for (const pos of positionsToBackfill) {
-                const resolved = await this.resolveMarketMetadata(
-                    pos.conditionId,
-                    pos.marketSlug,
-                    pos.assetAddress
-                );
-                const updateFields: Record<string, string> = {};
-                if (resolved.endDate && !pos.endDate) {
-                    pos.endDate = resolved.endDate;
-                    updateFields.endDate = resolved.endDate;
-                }
-                const isCorruptedSlug =
-                    pos.eventSlug === "xi-jinping-out-before-2027" &&
-                    pos.marketSlug !== "xi-jinping-out-before-2027";
-                if (resolved.eventSlug && (!pos.eventSlug || isCorruptedSlug)) {
-                    pos.eventSlug = resolved.eventSlug;
-                    updateFields.eventSlug = resolved.eventSlug;
-                }
-                if (Object.keys(updateFields).length > 0) {
-                    await this.positionModel.updateOne({ _id: pos._id }, { $set: updateFields });
-                    resolvedCount++;
-                }
-            }
-
-            console.log(
-                `[PositionsService] ✅ Rétro-résolution terminée : ${resolvedCount}/${positionsToBackfill.length} position(s) mise(s) à jour en base.`
-            );
-        } catch (err: unknown) {
-            console.warn(
-                "[PositionsService] Erreur lors de la rétro-résolution des métadonnées:",
-                err
-            );
-        }
+    async resolveMarketEndDate(
+        conditionId: string,
+        marketSlug?: string,
+        assetAddress?: string
+    ): Promise<string | undefined> {
+        return await this.metadataService.resolveMarketEndDate(
+            conditionId,
+            marketSlug,
+            assetAddress
+        );
     }
 
     private async getTargetAlias(address?: string): Promise<string | undefined> {
@@ -155,507 +93,143 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         }
     }
 
-    async resolveMarketMetadata(
-        conditionId: string,
-        marketSlug?: string,
-        assetAddress?: string
-    ): Promise<{ endDate?: string; eventSlug?: string }> {
-        if (!conditionId || conditionId === "0x") return {};
-
-        const cached = this.marketEndDateCache.get(conditionId);
-        if (cached) {
-            if (cached.date || cached.eventSlug) {
-                return { endDate: cached.date || undefined, eventSlug: cached.eventSlug };
-            }
-            if (Date.now() - cached.timestamp < 300_000) {
-                return {};
-            }
-        }
-
-        let resolvedDate: string | undefined;
-        let resolvedEventSlug: string | undefined;
-
-        const isHexConditionId = conditionId.startsWith("0x") && conditionId.length >= 64;
-        const isTokenIdDecimal = !isHexConditionId && /^\d+$/.test(conditionId);
-
-        // 1. Appel CLOB API
-        try {
-            const clobUrl = isTokenIdDecimal
-                ? `https://clob.polymarket.com/markets?token_id=${conditionId}`
-                : `https://clob.polymarket.com/markets/${conditionId}`;
-
-            const res = await fetch(clobUrl, {
-                signal: AbortSignal.timeout(5000),
-            });
-
-            if (res.ok) {
-                const json = await res.json();
-                const data = (Array.isArray(json?.data) ? json.data[0] : json?.data || json) as {
-                    end_date_iso?: string;
-                    game_start_time?: string;
-                    endDate?: string;
-                };
-                resolvedDate = data?.end_date_iso || data?.game_start_time || data?.endDate;
-            }
-        } catch (_err: unknown) {
-            // Poursuite vers Gamma
-        }
-
-        // 2. Appel Gamma API par condition_ids
-        if (isHexConditionId) {
-            try {
-                const res = await fetch(
-                    `https://gamma-api.polymarket.com/markets?condition_ids=${conditionId}`,
-                    { signal: AbortSignal.timeout(5000) }
-                );
-                if (res.ok) {
-                    const list = (await res.json()) as Array<{
-                        conditionId?: string;
-                        endDate?: string;
-                        endDateIso?: string;
-                        game_start_time?: string;
-                        events?: Array<{ slug?: string }>;
-                    }>;
-                    const matchedMarket = Array.isArray(list)
-                        ? list.find(
-                              (m) =>
-                                  m?.conditionId?.toLowerCase() === conditionId.toLowerCase()
-                          )
-                        : undefined;
-                    if (matchedMarket) {
-                        if (!resolvedDate) {
-                            resolvedDate =
-                                matchedMarket.endDate ||
-                                matchedMarket.endDateIso ||
-                                matchedMarket.game_start_time;
-                        }
-                        if (!resolvedEventSlug) {
-                            resolvedEventSlug = matchedMarket.events?.[0]?.slug;
-                        }
-                    }
+    private async updateTargetClosedStats(
+        targetAddress: string | undefined,
+        realizedPnlUsdc: number,
+        isWin: boolean
+    ): Promise<void> {
+        if (!targetAddress) return;
+        await this.targetModel
+            .updateOne(
+                { address: targetAddress.toLowerCase() },
+                {
+                    $inc: {
+                        "stats.realizedPnlUsdc": realizedPnlUsdc,
+                        ...(isWin ? { "stats.wonTrades": 1 } : { "stats.lostTrades": 1 }),
+                    },
                 }
-            } catch (_err: unknown) {
-                // Poursuite vers Token ID / Slug
-            }
-        }
-
-        // 3. Appel Gamma API par Token ID (si conditionId ou assetAddress est un token ID décimal)
-        const effectiveTokenId = isTokenIdDecimal
-            ? conditionId
-            : assetAddress && /^\d+$/.test(assetAddress)
-              ? assetAddress
-              : null;
-
-        if (effectiveTokenId && (!resolvedDate || !resolvedEventSlug)) {
-            try {
-                const res = await fetch(
-                    `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`,
-                    { signal: AbortSignal.timeout(5000) }
-                );
-                if (res.ok) {
-                    const list = (await res.json()) as Array<{
-                        conditionId?: string;
-                        clobTokenIds?: string[] | string;
-                        endDate?: string;
-                        endDateIso?: string;
-                        game_start_time?: string;
-                        events?: Array<{ slug?: string }>;
-                    }>;
-                    const matchedMarket = Array.isArray(list)
-                        ? list.find((m) => {
-                              if (!m) return false;
-                              if (
-                                  m.conditionId &&
-                                  conditionId &&
-                                  m.conditionId.toLowerCase() === conditionId.toLowerCase()
-                              ) {
-                                  return true;
-                              }
-                              if (m.clobTokenIds) {
-                                  const ids =
-                                      typeof m.clobTokenIds === "string"
-                                          ? JSON.parse(m.clobTokenIds)
-                                          : m.clobTokenIds;
-                                  return Array.isArray(ids) && ids.includes(effectiveTokenId);
-                              }
-                              return true;
-                          })
-                        : undefined;
-                    if (matchedMarket) {
-                        if (!resolvedDate) {
-                            resolvedDate =
-                                matchedMarket.endDate ||
-                                matchedMarket.endDateIso ||
-                                matchedMarket.game_start_time;
-                        }
-                        if (!resolvedEventSlug) {
-                            resolvedEventSlug = matchedMarket.events?.[0]?.slug;
-                        }
-                    }
-                }
-            } catch (_err: unknown) {
-                // Poursuite vers Slug
-            }
-        }
-
-        // 4. Appel Gamma API par slug (Events puis Markets)
-        if (
-            (!resolvedDate || !resolvedEventSlug) &&
-            marketSlug &&
-            marketSlug !== "market" &&
-            marketSlug !== "polymarket-market" &&
-            marketSlug !== "polygon-onchain"
-        ) {
-            // 4.1 Test sur /events?slug= (très fréquent pour sports et tournois)
-            try {
-                const eventRes = await fetch(
-                    `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(marketSlug)}`,
-                    { signal: AbortSignal.timeout(5000) }
-                );
-                if (eventRes.ok) {
-                    const eventList = (await eventRes.json()) as Array<{
-                        slug?: string;
-                        endDate?: string;
-                        endDateIso?: string;
-                        markets?: Array<{ endDate?: string; endDateIso?: string }>;
-                    }>;
-                    const ev = eventList[0];
-                    if (!resolvedDate) {
-                        resolvedDate =
-                            ev?.endDate ||
-                            ev?.endDateIso ||
-                            ev?.markets?.[0]?.endDate ||
-                            ev?.markets?.[0]?.endDateIso;
-                    }
-                    if (!resolvedEventSlug) {
-                        resolvedEventSlug = ev?.slug || marketSlug;
-                    }
-                }
-            } catch (_err: unknown) {
-                // Ignoré
-            }
-
-            // 4.2 Test sur /markets?slug=
-            if (!resolvedDate || !resolvedEventSlug) {
-                try {
-                    const marketRes = await fetch(
-                        `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(marketSlug)}`,
-                        { signal: AbortSignal.timeout(5000) }
-                    );
-                    if (marketRes.ok) {
-                        const marketList = (await marketRes.json()) as Array<{
-                            endDate?: string;
-                            endDateIso?: string;
-                            events?: Array<{ slug?: string }>;
-                        }>;
-                        if (!resolvedDate) {
-                            resolvedDate = marketList[0]?.endDate || marketList[0]?.endDateIso;
-                        }
-                        if (!resolvedEventSlug) {
-                            resolvedEventSlug = marketList[0]?.events?.[0]?.slug;
-                        }
-                    }
-                } catch (_err: unknown) {
-                    // Ignoré
-                }
-            }
-        }
-
-        if (resolvedDate || resolvedEventSlug) {
-            this.marketEndDateCache.set(conditionId, {
-                date: resolvedDate || "",
-                eventSlug: resolvedEventSlug,
-                timestamp: Date.now(),
-            });
-            return { endDate: resolvedDate, eventSlug: resolvedEventSlug };
-        }
-
-        // Cache négatif temporaire (5 min) pour éviter le spam réseau sans bloquer ad vitam
-        this.marketEndDateCache.set(conditionId, { date: "", timestamp: Date.now() });
-        return {};
+            )
+            .catch((err: unknown) =>
+                console.warn("[PositionsService] Erreur mise à jour stats cible sur clôture:", err)
+            );
     }
 
-    async resolveMarketEndDate(
-        conditionId: string,
-        marketSlug?: string,
-        assetAddress?: string
-    ): Promise<string | undefined> {
-        const meta = await this.resolveMarketMetadata(conditionId, marketSlug, assetAddress);
-        return meta.endDate;
+    /**
+     * Demande au service Bot (via WebSocket) de lancer immédiatement une vérification des résolutions.
+     * L'API n'interroge jamais Polymarket pour détecter si une position est clôturée.
+     */
+    requestPositionSync(): SyncRequestResponse {
+        const requestedAt = Date.now();
+        const botOnline = this.eventsGateway.isBotConnected();
+        if (!botOnline) {
+            return {
+                requested: false,
+                botOnline: false,
+                message:
+                    "Le bot est hors ligne : impossible de lancer une vérification de résolution pour le moment.",
+                requestedAt,
+            };
+        }
+
+        const sent = this.eventsGateway.sendToBots("bot:check-resolutions", { requestedAt });
+        return {
+            requested: sent,
+            botOnline: true,
+            message: sent
+                ? "Demande de vérification transmise au bot. Les résultats apparaîtront automatiquement."
+                : "Aucune session WebSocket bot disponible pour traiter la demande.",
+            requestedAt,
+        };
     }
 
-    async settleResolvedPositions(force = false): Promise<number> {
-        const now = Date.now();
-        // Si ce n'est pas un appel forcé (ex: clic utilisateur), on applique le throttling
-        if (!force && now - this.lastAutoSettleTimestamp < this.autoSettleThrottleMs) {
-            return 0;
-        }
-
-        // Single-Flight : si une exécution est déjà en cours, partager la promesse en vol
-        if (this.settlePromise) {
-            return await this.settlePromise;
-        }
-
-        this.lastAutoSettleTimestamp = now;
-        this.settlePromise = this.executeSettleResolvedPositions().finally(() => {
-            this.settlePromise = null;
+    /**
+     * Persiste la clôture d'une position détectée et transmise par le Bot.
+     * Atomique et idempotente : plusieurs appels concurrents ne ferment la position qu'une seule fois.
+     */
+    async closePosition(
+        conditionId: string,
+        dto: ClosePositionInput
+    ): Promise<OpenPosition | null> {
+        const existing = await this.positionModel.findOne({
+            conditionId,
+            status: { $ne: "CLOSED" },
         });
 
-        return await this.settlePromise;
-    }
-
-    private async executeSettleResolvedPositions(): Promise<number> {
-        const openPositions = await this.positionModel
-            .find({
-                status: { $ne: "CLOSED" },
-                totalShares: { $gt: 0 },
-            })
-            .exec();
-
-        let settledCount = 0;
-
-        for (const pos of openPositions) {
-            if (!pos.conditionId || pos.conditionId === "0x") continue;
-
-            let isClosed = false;
-            let winningOutcome: string | null = null;
-            let resolvedMarketDate: string | undefined = pos.endDate;
-
-            const isHexConditionId =
-                pos.conditionId.startsWith("0x") && pos.conditionId.length >= 64;
-            const isTokenIdDecimal = !isHexConditionId && /^\d+$/.test(pos.conditionId);
-
-            // 1. Interrogation CLOB API
-            try {
-                const clobUrl = isTokenIdDecimal
-                    ? `https://clob.polymarket.com/markets?token_id=${pos.conditionId}`
-                    : `https://clob.polymarket.com/markets/${pos.conditionId}`;
-
-                const res = await fetch(clobUrl, { signal: AbortSignal.timeout(4000) });
-                if (res.ok) {
-                    const json = await res.json();
-                    const data = (
-                        Array.isArray(json?.data) ? json.data[0] : json?.data || json
-                    ) as {
-                        closed?: boolean;
-                        end_date_iso?: string;
-                        game_start_time?: string;
-                        tokens?: Array<{ outcome?: string; winner?: boolean }>;
-                    };
-                    if (!resolvedMarketDate) {
-                        resolvedMarketDate = data?.end_date_iso || data?.game_start_time;
-                    }
-                    if (
-                        data?.closed === true &&
-                        Array.isArray(data?.tokens) &&
-                        data.tokens.length > 0
-                    ) {
-                        const winToken = data.tokens.find((t) => t.winner === true);
-                        if (winToken?.outcome) {
-                            isClosed = true;
-                            winningOutcome = winToken.outcome;
-                        }
-                    }
-                }
-            } catch (_err: unknown) {
-                // Fallback vers Gamma
-            }
-
-            // 2. Fallback Gamma API si non résolu via CLOB
-            if (!winningOutcome) {
-                try {
-                    const effectiveTokenId = isTokenIdDecimal
-                        ? pos.conditionId
-                        : pos.assetAddress && /^\d+$/.test(pos.assetAddress)
-                          ? pos.assetAddress
-                          : null;
-
-                    const gammaUrl = isHexConditionId
-                        ? `https://gamma-api.polymarket.com/markets?condition_ids=${pos.conditionId}`
-                        : effectiveTokenId
-                          ? `https://gamma-api.polymarket.com/markets?clob_token_ids=${effectiveTokenId}`
-                          : pos.marketSlug &&
-                              pos.marketSlug !== "market" &&
-                              pos.marketSlug !== "polymarket-market"
-                            ? `https://gamma-api.polymarket.com/markets?slug=${encodeURIComponent(pos.marketSlug)}`
-                            : null;
-
-                    if (gammaUrl) {
-                        const res = await fetch(gammaUrl, { signal: AbortSignal.timeout(4000) });
-                        if (res.ok) {
-                            const list = (await res.json()) as Array<{
-                                conditionId?: string;
-                                closed?: boolean;
-                                endDate?: string;
-                                endDateIso?: string;
-                                events?: Array<{ slug?: string }>;
-                                tokens?: Array<{ outcome?: string; winner?: boolean }>;
-                                outcomePrices?: string[] | string;
-                                outcomes?: string[] | string;
-                            }>;
-                            const market = isHexConditionId
-                                ? Array.isArray(list)
-                                    ? list.find(
-                                          (m) =>
-                                              m?.conditionId?.toLowerCase() ===
-                                              pos.conditionId.toLowerCase()
-                                      )
-                                    : undefined
-                                : Array.isArray(list)
-                                  ? list[0]
-                                  : undefined;
-                            if (market) {
-                                if (!resolvedMarketDate) {
-                                    resolvedMarketDate = market.endDate || market.endDateIso;
-                                }
-                                const resolvedEventSlug = market.events?.[0]?.slug;
-                                const isCorruptedSlug =
-                                    pos.eventSlug === "xi-jinping-out-before-2027" &&
-                                    pos.marketSlug !== "xi-jinping-out-before-2027";
-                                if ((!pos.eventSlug || isCorruptedSlug) && resolvedEventSlug) {
-                                    pos.eventSlug = resolvedEventSlug;
-                                    await this.positionModel.updateOne(
-                                        { _id: pos._id },
-                                        { $set: { eventSlug: resolvedEventSlug } }
-                                    );
-                                }
-                                if (market.closed === true) {
-                                    // Vérification tokens
-                                    const winToken = market.tokens?.find((t) => t.winner === true);
-                                    if (winToken?.outcome) {
-                                        isClosed = true;
-                                        winningOutcome = winToken.outcome;
-                                    } else {
-                                        // Analyse outcomePrices (ex: ["1", "0"])
-                                        const prices =
-                                            typeof market.outcomePrices === "string"
-                                                ? JSON.parse(market.outcomePrices)
-                                                : market.outcomePrices;
-                                        const outcomes =
-                                            typeof market.outcomes === "string"
-                                                ? JSON.parse(market.outcomes)
-                                                : market.outcomes;
-
-                                        if (Array.isArray(prices) && Array.isArray(outcomes)) {
-                                            const winIdx = prices.findIndex(
-                                                (p: string | number) => Number(p) >= 0.99
-                                            );
-                                            if (winIdx >= 0 && outcomes[winIdx]) {
-                                                isClosed = true;
-                                                winningOutcome = String(outcomes[winIdx]);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (_err: unknown) {
-                    // Ignorer erreurs temporaires
-                }
-            }
-
-            if (isClosed && winningOutcome) {
-                // Recharger le document frais depuis la base pour éviter toute donnée périmée
-                const freshPos = await this.positionModel.findOne({
-                    _id: pos._id,
-                    status: { $ne: "CLOSED" },
-                });
-
-                if (!freshPos) continue;
-
-                const isWin =
-                    freshPos.outcomeLabel.trim().toLowerCase() ===
-                    winningOutcome.trim().toLowerCase();
-
-                const settledPayoutUsdc = isWin ? Number(freshPos.totalShares.toFixed(2)) : 0;
-                const realizedPnlUsdc = Number(
-                    (settledPayoutUsdc - freshPos.totalInvestedUsdc).toFixed(2)
-                );
-                const closeReason = isWin ? "RESOLVED_WIN" : "RESOLVED_LOSS";
-                const now = Date.now();
-
-                // Mise à jour conditionnelle atomique : garantit l'idempotence stricte
-                const updatedDoc = await this.positionModel.findOneAndUpdate(
-                    {
-                        _id: freshPos._id,
-                        status: { $ne: "CLOSED" },
-                    },
-                    {
-                        $set: {
-                            status: "CLOSED",
-                            closeReason,
-                            settledPayoutUsdc,
-                            realizedPnlUsdc,
-                            currentMarketPrice: isWin ? 1.0 : 0.0,
-                            currentMarketValueUsdc: settledPayoutUsdc,
-                            ...(resolvedMarketDate && !freshPos.endDate
-                                ? { endDate: resolvedMarketDate }
-                                : {}),
-                            closedAt: now,
-                            updatedAt: now,
-                        },
-                    },
-                    { new: true }
-                );
-
-                if (!updatedDoc) {
-                    continue;
-                }
-
-                settledCount++;
-
-                this.eventsGateway.broadcast("position:closed", {
-                    conditionId: updatedDoc.conditionId,
-                    positionId: updatedDoc.positionId,
-                    closeReason,
-                    settledPayoutUsdc,
-                    realizedPnlUsdc,
-                });
-
-                if (updatedDoc.targetAddress) {
-                    await this.targetModel
-                        .updateOne(
-                            { address: updatedDoc.targetAddress.toLowerCase() },
-                            {
-                                $inc: {
-                                    "stats.realizedPnlUsdc": realizedPnlUsdc,
-                                    ...(isWin
-                                        ? { "stats.wonTrades": 1 }
-                                        : { "stats.lostTrades": 1 }),
-                                },
-                            }
-                        )
-                        .catch((e) =>
-                            console.warn(
-                                "[PositionsService] Erreur mise à jour stats cible sur clôture:",
-                                e
-                            )
-                        );
-                }
-
-                // Notification Discord enrichie (une seule fois garantie)
-                const mapped = this.mapToPosition(updatedDoc.toObject());
-                const alias = await this.getTargetAlias(updatedDoc.targetAddress);
-                await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
-            } else if (resolvedMarketDate && !pos.endDate) {
-                // Même si pas encore résolu, sauvegarder la date résolue trouvée
-                await this.positionModel.updateOne(
-                    { _id: pos._id },
-                    { $set: { endDate: resolvedMarketDate } }
-                );
-            }
+        if (!existing) {
+            return null;
         }
 
-        return settledCount;
+        const isWin = dto.closeReason === "RESOLVED_WIN";
+        const settledPayoutUsdc =
+            dto.settledPayoutUsdc !== undefined
+                ? Number(dto.settledPayoutUsdc.toFixed(2))
+                : isWin
+                  ? Number(existing.totalShares.toFixed(2))
+                  : 0;
+        const realizedPnlUsdc = Number((settledPayoutUsdc - existing.totalInvestedUsdc).toFixed(2));
+        const closedAt = dto.closedAt ?? Date.now();
+
+        const closedMarketPrice =
+            dto.closeReason === "RESOLVED_WIN"
+                ? 1.0
+                : dto.closeReason === "RESOLVED_LOSS"
+                  ? 0.0
+                  : existing.totalShares > 0
+                    ? Math.min(
+                          1,
+                          Math.max(0, Number((settledPayoutUsdc / existing.totalShares).toFixed(4)))
+                      )
+                    : 0.0;
+
+        const updatedDoc = await this.positionModel.findOneAndUpdate(
+            {
+                _id: existing._id,
+                status: { $ne: "CLOSED" },
+            },
+            {
+                $set: {
+                    status: "CLOSED",
+                    closeReason: dto.closeReason,
+                    settledPayoutUsdc,
+                    realizedPnlUsdc,
+                    currentMarketPrice: closedMarketPrice,
+                    currentMarketValueUsdc: settledPayoutUsdc,
+                    unrealizedPnlUsdc: 0,
+                    unrealizedPnlPercent: 0,
+                    ...(dto.endDate && !existing.endDate ? { endDate: dto.endDate } : {}),
+                    closedAt,
+                    updatedAt: closedAt,
+                },
+            },
+            { new: true }
+        );
+
+        if (!updatedDoc) {
+            return null;
+        }
+
+        this.eventsGateway.broadcast("position:closed", {
+            conditionId: updatedDoc.conditionId,
+            positionId: updatedDoc.positionId,
+            closeReason: dto.closeReason,
+            settledPayoutUsdc,
+            realizedPnlUsdc,
+        });
+
+        await this.updateTargetClosedStats(
+            updatedDoc.targetAddress,
+            realizedPnlUsdc,
+            isWin || realizedPnlUsdc > 0
+        );
+
+        const mapped = this.mapToPosition(updatedDoc.toObject());
+        const alias = await this.getTargetAlias(updatedDoc.targetAddress);
+        await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
+
+        return mapped;
     }
 
     async findAll(): Promise<OpenPosition[]> {
-        // Déclenchement asynchrone en arrière-plan sans bloquer la requête HTTP
-        this.settleResolvedPositions(false).catch((_err: unknown) => {
-            // Ignorer les erreurs réseau temporaires
-        });
-
         const docs = await this.positionModel
             .find({
                 status: { $ne: "CLOSED" },
@@ -665,41 +239,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             .lean()
             .exec();
 
-        // Résolution paresseuse des métadonnées manquantes (dates, eventSlug)
-        await Promise.all(
-            docs.map(async (doc) => {
-                const isCorruptedSlug =
-                    doc.eventSlug === "xi-jinping-out-before-2027" &&
-                    doc.marketSlug !== "xi-jinping-out-before-2027";
-                if (
-                    (!doc.endDate || !doc.eventSlug || isCorruptedSlug) &&
-                    doc.conditionId &&
-                    doc.conditionId !== "0x"
-                ) {
-                    const resolved = await this.resolveMarketMetadata(
-                        doc.conditionId,
-                        doc.marketSlug,
-                        doc.assetAddress
-                    );
-                    const updateFields: Record<string, string> = {};
-                    if (resolved.endDate && !doc.endDate) {
-                        doc.endDate = resolved.endDate;
-                        updateFields.endDate = resolved.endDate;
-                    }
-                    if (resolved.eventSlug && (!doc.eventSlug || isCorruptedSlug)) {
-                        doc.eventSlug = resolved.eventSlug;
-                        updateFields.eventSlug = resolved.eventSlug;
-                    }
-                    if (Object.keys(updateFields).length > 0) {
-                        await this.positionModel.updateOne(
-                            { _id: doc._id },
-                            { $set: updateFields }
-                        );
-                    }
-                }
-            })
-        );
-
+        await this.metadataService.enrichPositionsMetadata(docs, this.positionModel);
         return docs.map((doc) => this.mapToPosition(doc));
     }
 
@@ -711,42 +251,30 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             .lean()
             .exec();
 
-        // Résolution paresseuse des métadonnées manquantes sur les positions clôturées
-        await Promise.all(
-            docs.map(async (doc) => {
-                const isCorruptedSlug =
-                    doc.eventSlug === "xi-jinping-out-before-2027" &&
-                    doc.marketSlug !== "xi-jinping-out-before-2027";
-                if (
-                    (!doc.endDate || !doc.eventSlug || isCorruptedSlug) &&
-                    doc.conditionId &&
-                    doc.conditionId !== "0x"
-                ) {
-                    const resolved = await this.resolveMarketMetadata(
-                        doc.conditionId,
-                        doc.marketSlug,
-                        doc.assetAddress
-                    );
-                    const updateFields: Record<string, string> = {};
-                    if (resolved.endDate && !doc.endDate) {
-                        doc.endDate = resolved.endDate;
-                        updateFields.endDate = resolved.endDate;
-                    }
-                    if (resolved.eventSlug && (!doc.eventSlug || isCorruptedSlug)) {
-                        doc.eventSlug = resolved.eventSlug;
-                        updateFields.eventSlug = resolved.eventSlug;
-                    }
-                    if (Object.keys(updateFields).length > 0) {
-                        await this.positionModel.updateOne(
-                            { _id: doc._id },
-                            { $set: updateFields }
-                        );
-                    }
-                }
-            })
-        );
-
+        await this.metadataService.enrichPositionsMetadata(docs, this.positionModel);
         return docs.map((doc) => this.mapToPosition(doc));
+    }
+
+    async getClosedSummary(since?: number): Promise<ClosedPositionsTotals> {
+        const matchQuery: Record<string, unknown> = { status: "CLOSED" };
+        if (since && since > 0) {
+            const sinceMs = since < 100_000_000_000 ? since * 1000 : since;
+            matchQuery.$expr = {
+                $gte: [buildTimestampMsExpr("$closedAt", "$updatedAt"), sinceMs],
+            };
+        }
+
+        const [statsDoc] = (await this.positionModel.aggregate([
+            { $match: matchQuery },
+            {
+                $group: {
+                    _id: null,
+                    ...CLOSED_POSITION_STATS_ACCUMULATORS,
+                },
+            },
+        ])) as RawClosedStatsDoc[];
+
+        return formatClosedPositionsTotals(statsDoc);
     }
 
     async findUnredeemedWinningPositions(): Promise<OpenPosition[]> {
@@ -805,35 +333,28 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         page: number;
         limit: number;
         totalPages: number;
-        totals: {
-            count: number;
-            totalInvested: number;
-            totalPayout: number;
-            totalGains: number;
-            totalLosses: number;
-            netPnl: number;
-            totalShares: number;
-            avgEntryPrice: number;
-            winCount: number;
-            lossCount: number;
-            winRate: number;
-            roiPercent: number;
-        };
+        totals: ClosedPositionsTotals;
     }> {
-        const page = Math.max(1, query.page ? Number(query.page) : 1);
-        const limit = Math.min(100, Math.max(1, query.limit ? Number(query.limit) : 25));
-        const skip = (page - 1) * limit;
+        const { page, limit, skip } = normalizePagination(
+            query.page ? Number(query.page) : undefined,
+            query.limit ? Number(query.limit) : undefined,
+            20,
+            100
+        );
 
         const matchQuery: Record<string, unknown> = { status: "CLOSED" };
         if (query.status === "WIN") {
-            matchQuery.closeReason = "RESOLVED_WIN";
+            Object.assign(matchQuery, CLOSED_WIN_MATCH);
         } else if (query.status === "LOSS") {
-            matchQuery.closeReason = "RESOLVED_LOSS";
+            Object.assign(matchQuery, CLOSED_LOSS_MATCH);
         }
 
         const since = query.since ? Number(query.since) : undefined;
         if (since && since > 0) {
-            matchQuery.$or = [{ closedAt: { $gte: since } }, { updatedAt: { $gte: since } }];
+            const sinceMs = since < 100_000_000_000 ? since * 1000 : since;
+            matchQuery.$expr = {
+                $gte: [buildTimestampMsExpr("$closedAt", "$updatedAt"), sinceMs],
+            };
         }
 
         const [aggregationResult] = await this.positionModel.aggregate([
@@ -849,39 +370,7 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         {
                             $group: {
                                 _id: null,
-                                totalInvested: { $sum: "$totalInvestedUsdc" },
-                                totalPayout: { $sum: "$settledPayoutUsdc" },
-                                netPnl: { $sum: "$realizedPnlUsdc" },
-                                totalShares: { $sum: "$totalShares" },
-                                winCount: {
-                                    $sum: {
-                                        $cond: [{ $eq: ["$closeReason", "RESOLVED_WIN"] }, 1, 0],
-                                    },
-                                },
-                                lossCount: {
-                                    $sum: {
-                                        $cond: [{ $eq: ["$closeReason", "RESOLVED_LOSS"] }, 1, 0],
-                                    },
-                                },
-                                totalGains: {
-                                    $sum: {
-                                        $cond: [
-                                            { $gt: ["$realizedPnlUsdc", 0] },
-                                            "$realizedPnlUsdc",
-                                            0,
-                                        ],
-                                    },
-                                },
-                                totalLosses: {
-                                    $sum: {
-                                        $cond: [
-                                            { $lt: ["$realizedPnlUsdc", 0] },
-                                            { $abs: "$realizedPnlUsdc" },
-                                            0,
-                                        ],
-                                    },
-                                },
-                                count: { $sum: 1 },
+                                ...CLOSED_POSITION_STATS_ACCUMULATORS,
                             },
                         },
                     ],
@@ -890,95 +379,27 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
         ]);
 
         const rawItems = (aggregationResult?.items || []) as PositionDocument[];
+        await this.metadataService.enrichPositionsMetadata(rawItems, this.positionModel);
 
-        // Résolution paresseuse des métadonnées manquantes sur les items paginés
-        await Promise.all(
-            rawItems.map(async (doc) => {
-                const isCorruptedSlug =
-                    doc.eventSlug === "xi-jinping-out-before-2027" &&
-                    doc.marketSlug !== "xi-jinping-out-before-2027";
-                if (
-                    (!doc.endDate || !doc.eventSlug || isCorruptedSlug) &&
-                    doc.conditionId &&
-                    doc.conditionId !== "0x"
-                ) {
-                    const resolved = await this.resolveMarketMetadata(
-                        doc.conditionId,
-                        doc.marketSlug,
-                        doc.assetAddress
-                    );
-                    const updateFields: Record<string, string> = {};
-                    if (resolved.endDate && !doc.endDate) {
-                        doc.endDate = resolved.endDate;
-                        updateFields.endDate = resolved.endDate;
-                    }
-                    if (resolved.eventSlug && (!doc.eventSlug || isCorruptedSlug)) {
-                        doc.eventSlug = resolved.eventSlug;
-                        updateFields.eventSlug = resolved.eventSlug;
-                    }
-                    if (Object.keys(updateFields).length > 0) {
-                        await this.positionModel.updateOne(
-                            { _id: doc._id },
-                            { $set: updateFields }
-                        );
-                    }
-                }
-            })
+        const totals = formatClosedPositionsTotals(
+            aggregationResult?.stats?.[0] as RawClosedStatsDoc | undefined
         );
 
-        const statsDoc = aggregationResult?.stats?.[0] || {
-            totalInvested: 0,
-            totalPayout: 0,
-            netPnl: 0,
-            totalShares: 0,
-            winCount: 0,
-            lossCount: 0,
-            totalGains: 0,
-            totalLosses: 0,
-            count: 0,
-        };
-
-        const count = Number(statsDoc.count || 0);
-        const totalInvested = Number(statsDoc.totalInvested || 0);
-        const totalPayout = Number(statsDoc.totalPayout || 0);
-        const netPnl = Number(statsDoc.netPnl || 0);
-        const totalShares = Number(statsDoc.totalShares || 0);
-        const winCount = Number(statsDoc.winCount || 0);
-        const lossCount = Number(statsDoc.lossCount || 0);
-        const totalGains = Number(statsDoc.totalGains || 0);
-        const totalLosses = Number(statsDoc.totalLosses || 0);
-        const avgEntryPrice = totalShares > 0 ? totalInvested / totalShares : 0;
-        const winRate = count > 0 ? (winCount / count) * 100 : 0;
-        const roiPercent = totalInvested > 0 ? (netPnl / totalInvested) * 100 : 0;
-
-        return {
-            items: rawItems.map((doc) => this.mapToPosition(doc)),
-            total: count,
+        return buildPaginatedResponse(
+            rawItems.map((doc) => this.mapToPosition(doc)),
+            totals.count,
             page,
             limit,
-            totalPages: Math.ceil(count / limit) || 1,
-            totals: {
-                count,
-                totalInvested,
-                totalPayout,
-                totalGains,
-                totalLosses,
-                netPnl,
-                totalShares,
-                avgEntryPrice,
-                winCount,
-                lossCount,
-                winRate,
-                roiPercent,
-            },
-        };
+            { totals }
+        );
     }
 
     async findById(id: string): Promise<OpenPosition> {
-        const doc = await this.positionModel.findById(id).lean().exec();
-        if (!doc) {
-            throw new NotFoundException(`Position introuvable avec l'ID ${id}`);
-        }
+        const doc = await findByIdOrThrow(
+            this.positionModel,
+            id,
+            `Position introuvable avec l'ID ${id}`
+        );
         return this.mapToPosition(doc);
     }
 
@@ -1014,19 +435,22 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
 
         if (!existing) {
             const positionId = `pos_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-            const resolvedMeta = await this.resolveMarketMetadata(
-                trade.conditionId,
-                marketInfo?.marketSlug,
-                trade.assetAddress
-            );
+            const providedEventSlug = marketInfo?.eventSlug || trade.eventSlug;
+            const needsMetadataLookup = !marketInfo?.endDate || !providedEventSlug;
+            const resolvedMeta = needsMetadataLookup
+                ? await this.resolveMarketMetadata(
+                      trade.conditionId,
+                      marketInfo?.marketSlug,
+                      trade.assetAddress
+                  )
+                : {};
             const resolvedEndDate = marketInfo?.endDate || resolvedMeta.endDate;
-            const resolvedEventSlug =
-                marketInfo?.eventSlug || trade.eventSlug || resolvedMeta.eventSlug;
+            const resolvedEventSlug = providedEventSlug || resolvedMeta.eventSlug;
 
             const newPos = new this.positionModel({
                 positionId,
                 conditionId: trade.conditionId,
-                assetAddress: (trade.assetAddress || trade.conditionId).toLowerCase(),
+                assetAddress: targetAssetAddress,
                 marketSlug: marketInfo?.marketSlug || "market",
                 eventSlug: resolvedEventSlug,
                 marketQuestion: marketInfo?.marketQuestion || "Polymarket Question",
@@ -1060,9 +484,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             existing.unrealizedPnlPercent =
                 newTotalInvested > 0 ? (existing.unrealizedPnlUsdc / newTotalInvested) * 100 : 0;
             existing.updatedAt = trade.executedAt;
-            const isCorruptedExistingSlug =
-                existing.eventSlug === "xi-jinping-out-before-2027" &&
-                (marketInfo?.marketSlug || existing.marketSlug) !== "xi-jinping-out-before-2027";
+
+            const isCorruptedExistingSlug = this.metadataService.isCorruptedEventSlug(
+                existing.eventSlug,
+                marketInfo?.marketSlug || existing.marketSlug
+            );
             if (!existing.endDate || !existing.eventSlug || isCorruptedExistingSlug) {
                 const resolved = await this.resolveMarketMetadata(
                     trade.conditionId,
@@ -1115,9 +541,11 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                         status: "CLOSED",
                         closeReason: "WHALE_SELL",
                         settledPayoutUsdc: proceeds,
-                        realizedPnlUsdc,
-                        totalShares: 0,
-                        currentMarketValueUsdc: 0,
+                        realizedPnlUsdc: Number(realizedPnlUsdc.toFixed(2)),
+                        currentMarketPrice: trade.executedPrice,
+                        currentMarketValueUsdc: proceeds,
+                        unrealizedPnlUsdc: 0,
+                        unrealizedPnlPercent: 0,
                         closedAt: trade.executedAt,
                         updatedAt: trade.executedAt,
                     },
@@ -1135,27 +563,12 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
                 realizedPnlUsdc: updated.realizedPnlUsdc,
             });
 
-            if (updated.targetAddress) {
-                const isWin = (updated.realizedPnlUsdc ?? 0) > 0;
-                await this.targetModel
-                    .updateOne(
-                        { address: updated.targetAddress.toLowerCase() },
-                        {
-                            $inc: {
-                                "stats.realizedPnlUsdc": updated.realizedPnlUsdc ?? 0,
-                                ...(isWin ? { "stats.wonTrades": 1 } : { "stats.lostTrades": 1 }),
-                            },
-                        }
-                    )
-                    .catch((e) =>
-                        console.warn(
-                            "[PositionsService] Erreur mise à jour stats cible sur SELL:",
-                            e
-                        )
-                    );
-            }
+            await this.updateTargetClosedStats(
+                updated.targetAddress,
+                updated.realizedPnlUsdc ?? 0,
+                (updated.realizedPnlUsdc ?? 0) > 0
+            );
 
-            // Notification Discord enrichie (une seule fois garantie)
             const mapped = this.mapToPosition(updated.toObject());
             const alias = await this.getTargetAlias(updated.targetAddress);
             await this.discordNotifier.sendClosedPositionAlert(mapped, alias);
@@ -1202,9 +615,13 @@ export class PositionsService implements OnModuleInit, OnModuleDestroy {
             status: statusVal,
             closeReason: closeReasonVal as OpenPosition["closeReason"],
             settledPayoutUsdc:
-                doc.settledPayoutUsdc !== undefined ? Number(doc.settledPayoutUsdc) : undefined,
+                doc.settledPayoutUsdc !== undefined && doc.settledPayoutUsdc !== null
+                    ? Number(doc.settledPayoutUsdc)
+                    : undefined,
             realizedPnlUsdc:
-                doc.realizedPnlUsdc !== undefined ? Number(doc.realizedPnlUsdc) : undefined,
+                doc.realizedPnlUsdc !== undefined && doc.realizedPnlUsdc !== null
+                    ? Number(doc.realizedPnlUsdc)
+                    : undefined,
             settleTxHash: doc.settleTxHash ? String(doc.settleTxHash) : undefined,
             closedAt: doc.closedAt ? Number(doc.closedAt) : undefined,
             totalShares: Number(doc.totalShares),

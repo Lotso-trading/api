@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { MongooseModule } from "@nestjs/mongoose";
+import { PolymarketMetadataService } from "../../common/services/polymarket-metadata.service.ts";
 import { PositionModel, PositionSchema } from "../../database/schemas/position.schema.ts";
 import { TargetModel, TargetSchema } from "../../database/schemas/target.schema.ts";
 import { PositionsController } from "./positions.controller.ts";
@@ -13,7 +14,7 @@ import { PositionsService } from "./positions.service.ts";
         ]),
     ],
     controllers: [PositionsController],
-    providers: [PositionsService],
+    providers: [PolymarketMetadataService, PositionsService],
     exports: [PositionsService],
 })
 export class PositionsModule {}

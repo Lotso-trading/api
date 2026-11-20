@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM denoland/deno:latest
 
 WORKDIR /app
@@ -8,8 +9,18 @@ COPY services/api/ services/api/
 
 WORKDIR /app/services/api
 
-# Pré-cache des dépendances Deno
-RUN deno cache src/main.ts
+# Pré-cache des dépendances Deno via BuildKit secret (aucun token persisté dans les layers)
+RUN --mount=type=secret,id=github_token \
+    sh -ec ' \
+        trap "rm -f \"$HOME/.npmrc\"" EXIT; \
+        TOKEN="$(tr -d "\r\n" < /run/secrets/github_token 2>/dev/null || true)"; \
+        if [ -z "$TOKEN" ]; then \
+            echo "ERROR: Secret BuildKit github_token vide. Définissez GITHUB_TOKEN (scope read:packages) dans .env ou votre shell." >&2; \
+            exit 1; \
+        fi; \
+        printf "@lotso-trading:registry=https://npm.pkg.github.com/\n//npm.pkg.github.com/:_authToken=%s\n" "$TOKEN" > "$HOME/.npmrc"; \
+        deno cache --min-dep-age=0 src/main.ts \
+    '
 
 EXPOSE 3000
 EXPOSE 3001

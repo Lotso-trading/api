@@ -1,8 +1,8 @@
 import {
     type ExecutedTrade,
     ExecutedTradeSchema,
-    type PaginationQuery,
-    PaginationQuerySchema,
+    type TradesQuery,
+    TradesQuerySchema,
 } from "@lotso-trading/shared";
 import { Body, Controller, Get, Post, Query, UsePipes } from "@nestjs/common";
 import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe.ts";
@@ -13,13 +13,12 @@ export class TradesController {
     constructor(private readonly tradesService: TradesService) {}
 
     @Get()
-    async findAll(
-        @Query(new ZodValidationPipe(PaginationQuerySchema)) query: PaginationQuery
-    ): Promise<{
+    async findAll(@Query(new ZodValidationPipe(TradesQuerySchema)) query: TradesQuery): Promise<{
         items: ExecutedTrade[];
         total: number;
         page: number;
         limit: number;
+        totalPages: number;
     }> {
         return await this.tradesService.findAll(query);
     }

@@ -31,8 +31,11 @@ export class BotConfigService {
         this.isBotOnlineState = isOnline;
     }
 
-    async recordHeartbeat(): Promise<void> {
+    async recordHeartbeat(version?: string): Promise<void> {
         this.setBotOnline(true);
+        if (typeof version === "string" && version.trim()) {
+            this.eventsGateway.setBotVersion(version);
+        }
         const cfg = await this.getConfig();
         this.eventsGateway.broadcast("config:updated", cfg);
     }
@@ -41,6 +44,27 @@ export class BotConfigService {
         this.setBotOnline(false);
         const cfg = await this.getConfig();
         this.eventsGateway.broadcast("config:updated", cfg);
+    }
+
+    private mapToRiskConfig(doc: Record<string, unknown> | null | undefined): RiskConfig {
+        return {
+            balancePercentPerTrade: Number(doc?.balancePercentPerTrade ?? 0.03),
+            maxSlippagePercent: Number(doc?.maxSlippagePercent ?? 2.0),
+            maxCapPerTradeUsdc: Number(doc?.maxCapPerTradeUsdc ?? 50.0),
+            maxExposurePerMarketUsdc: Number(doc?.maxExposurePerMarketUsdc ?? 150.0),
+            maxExposurePerTargetUsdc: Number(doc?.maxExposurePerTargetUsdc ?? 300.0),
+            minCashReserveUsdc: Number(doc?.minCashReserveUsdc ?? 5.0),
+            minTradeSizeUsdc: Number(doc?.minTradeSizeUsdc ?? 2.0),
+            minPrice: Number(doc?.minPrice ?? 0.05),
+            maxPrice: Number(doc?.maxPrice ?? 0.9),
+            copySellOrders: Boolean(doc?.copySellOrders ?? true),
+            dryRun: Boolean(doc?.dryRun ?? true),
+            simulatedBalanceUsdc: Number(doc?.simulatedBalanceUsdc ?? 1000.0),
+            maxAllocatedCapitalUsdc: Number(doc?.maxAllocatedCapitalUsdc ?? 0),
+            profitReinvestmentPercent: Number(doc?.profitReinvestmentPercent ?? 50.0),
+            isBotRunning: Boolean(doc?.isBotRunning ?? true),
+            isBotOnline: this.isBotOnline(),
+        };
     }
 
     async getConfig(): Promise<RiskConfig> {
@@ -68,24 +92,7 @@ export class BotConfigService {
             doc = saved.toObject();
         }
 
-        return {
-            balancePercentPerTrade: Number(doc.balancePercentPerTrade),
-            maxSlippagePercent: Number(doc.maxSlippagePercent),
-            maxCapPerTradeUsdc: Number(doc.maxCapPerTradeUsdc),
-            maxExposurePerMarketUsdc: Number(doc.maxExposurePerMarketUsdc ?? 150.0),
-            maxExposurePerTargetUsdc: Number(doc.maxExposurePerTargetUsdc ?? 300.0),
-            minCashReserveUsdc: Number(doc.minCashReserveUsdc ?? 5.0),
-            minTradeSizeUsdc: Number(doc.minTradeSizeUsdc ?? 2.0),
-            minPrice: Number(doc.minPrice),
-            maxPrice: Number(doc.maxPrice),
-            copySellOrders: Boolean(doc.copySellOrders),
-            dryRun: Boolean(doc.dryRun),
-            simulatedBalanceUsdc: Number(doc.simulatedBalanceUsdc ?? 1000.0),
-            maxAllocatedCapitalUsdc: Number(doc.maxAllocatedCapitalUsdc ?? 0),
-            profitReinvestmentPercent: Number(doc.profitReinvestmentPercent ?? 50.0),
-            isBotRunning: Boolean(doc.isBotRunning),
-            isBotOnline: this.isBotOnline(),
-        };
+        return this.mapToRiskConfig(doc as unknown as Record<string, unknown>);
     }
 
     async updateConfig(dto: UpdateRiskConfigInput): Promise<RiskConfig> {
@@ -141,25 +148,7 @@ export class BotConfigService {
             .lean()
             .exec();
 
-        const result: RiskConfig = {
-            balancePercentPerTrade: Number(updated?.balancePercentPerTrade),
-            maxSlippagePercent: Number(updated?.maxSlippagePercent),
-            maxCapPerTradeUsdc: Number(updated?.maxCapPerTradeUsdc),
-            maxExposurePerMarketUsdc: Number(updated?.maxExposurePerMarketUsdc ?? 150.0),
-            maxExposurePerTargetUsdc: Number(updated?.maxExposurePerTargetUsdc ?? 300.0),
-            minCashReserveUsdc: Number(updated?.minCashReserveUsdc ?? 5.0),
-            minTradeSizeUsdc: Number(updated?.minTradeSizeUsdc ?? 2.0),
-            minPrice: Number(updated?.minPrice),
-            maxPrice: Number(updated?.maxPrice),
-            copySellOrders: Boolean(updated?.copySellOrders),
-            dryRun: Boolean(updated?.dryRun),
-            simulatedBalanceUsdc: Number(updated?.simulatedBalanceUsdc ?? 1000.0),
-            maxAllocatedCapitalUsdc: Number(updated?.maxAllocatedCapitalUsdc ?? 0),
-            profitReinvestmentPercent: Number(updated?.profitReinvestmentPercent ?? 50.0),
-            isBotRunning: Boolean(updated?.isBotRunning),
-            isBotOnline: this.isBotOnline(),
-        };
-
+        const result = this.mapToRiskConfig(updated as unknown as Record<string, unknown>);
         this.eventsGateway.broadcast("config:updated", result);
         return result;
     }

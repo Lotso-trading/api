@@ -1,5 +1,13 @@
-import { ClosedPositionsQuerySchema, type OpenPosition } from "@lotso-trading/shared";
+import {
+    ClosedPositionsQuerySchema,
+    type ClosedPositionsTotals,
+    type ClosePositionInput,
+    ClosePositionInputSchema,
+    type OpenPosition,
+    type SyncRequestResponse,
+} from "@lotso-trading/shared";
 import { Body, Controller, Get, Param, Post, Query } from "@nestjs/common";
+import { ZodValidationPipe } from "../../common/pipes/zod-validation.pipe.ts";
 import { PositionsService } from "./positions.service.ts";
 
 @Controller("positions")
@@ -11,6 +19,14 @@ export class PositionsController {
         return await this.positionsService.findAll();
     }
 
+    @Get("closed-summary")
+    async getClosedSummary(@Query("since") rawSince?: string): Promise<ClosedPositionsTotals> {
+        const since = rawSince !== undefined ? Number(rawSince) : undefined;
+        const validSince =
+            since !== undefined && !Number.isNaN(since) && since > 0 ? since : undefined;
+        return await this.positionsService.getClosedSummary(validSince);
+    }
+
     @Get("closed")
     async findClosed(@Query() rawQuery?: Record<string, unknown>): Promise<
         | OpenPosition[]
@@ -20,7 +36,7 @@ export class PositionsController {
               page: number;
               limit: number;
               totalPages: number;
-              totals: unknown;
+              totals: ClosedPositionsTotals;
           }
     > {
         if (
@@ -41,13 +57,22 @@ export class PositionsController {
         return await this.positionsService.findUnredeemedWinningPositions();
     }
 
+    @Post("sync-request")
+    requestSync(): SyncRequestResponse {
+        return this.positionsService.requestPositionSync();
+    }
+
     @Post("settle")
-    async settle(): Promise<{ settledCount: number; message: string }> {
-        const settledCount = await this.positionsService.settleResolvedPositions(true);
-        return {
-            settledCount,
-            message: `${settledCount} position(s) résolue(s) et créditée(s) au cash disponible.`,
-        };
+    settle(): SyncRequestResponse {
+        return this.positionsService.requestPositionSync();
+    }
+
+    @Post(":conditionId/close")
+    async closePosition(
+        @Param("conditionId") conditionId: string,
+        @Body(new ZodValidationPipe(ClosePositionInputSchema)) dto: ClosePositionInput
+    ): Promise<OpenPosition | null> {
+        return await this.positionsService.closePosition(conditionId, dto);
     }
 
     @Post(":conditionId/redeem")

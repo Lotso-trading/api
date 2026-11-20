@@ -2,6 +2,8 @@ import type { AddTargetInput, TargetTrader, UpdateTargetInput } from "@lotso-tra
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
+import { findByIdOrThrow } from "../../common/utils/entity-lookup.util.ts";
+import { CLOSED_WIN_EXPR } from "../../common/utils/position-stats.util.ts";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
 import { EventsGateway } from "../gateway/events.gateway.ts";
@@ -34,30 +36,12 @@ export class TargetsService {
                         realizedPnlUsdc: { $sum: "$realizedPnlUsdc" },
                         wonTrades: {
                             $sum: {
-                                $cond: [
-                                    {
-                                        $or: [
-                                            { $eq: ["$closeReason", "RESOLVED_WIN"] },
-                                            { $gt: ["$realizedPnlUsdc", 0] },
-                                        ],
-                                    },
-                                    1,
-                                    0,
-                                ],
+                                $cond: [CLOSED_WIN_EXPR, 1, 0],
                             },
                         },
                         lostTrades: {
                             $sum: {
-                                $cond: [
-                                    {
-                                        $or: [
-                                            { $eq: ["$closeReason", "RESOLVED_LOSS"] },
-                                            { $lt: ["$realizedPnlUsdc", 0] },
-                                        ],
-                                    },
-                                    1,
-                                    0,
-                                ],
+                                $cond: [CLOSED_WIN_EXPR, 0, 1],
                             },
                         },
                     },
@@ -93,10 +77,11 @@ export class TargetsService {
     }
 
     async findById(id: string): Promise<TargetTrader> {
-        const doc = await this.targetModel.findById(id).lean().exec();
-        if (!doc) {
-            throw new NotFoundException(`Baleine cible introuvable avec l'ID ${id}`);
-        }
+        const doc = await findByIdOrThrow(
+            this.targetModel,
+            id,
+            `Baleine cible introuvable avec l'ID ${id}`
+        );
         const statsMap = await this.getTargetsStatsAggregated();
         return this.mapToTrader(doc, statsMap.get(String(doc.address).toLowerCase()));
     }
@@ -140,27 +125,32 @@ export class TargetsService {
     }
 
     async update(id: string, dto: UpdateTargetInput): Promise<TargetTrader> {
+        const setFields: Record<string, unknown> = {
+            ...(dto.alias !== undefined && { alias: dto.alias }),
+            ...(dto.proxyAddress !== undefined && {
+                proxyAddress: dto.proxyAddress.toLowerCase(),
+            }),
+            ...(dto.username !== undefined && { username: dto.username }),
+            ...(dto.enabled !== undefined && { enabled: dto.enabled }),
+            ...(dto.maxUsdcPerTrade !== undefined &&
+                dto.maxUsdcPerTrade !== null && {
+                    maxUsdcPerTrade: dto.maxUsdcPerTrade,
+                }),
+            ...(dto.weightMultiplier !== undefined && {
+                weightMultiplier: dto.weightMultiplier,
+            }),
+        };
+
+        const updateOp: Record<string, unknown> = {};
+        if (Object.keys(setFields).length > 0) {
+            updateOp.$set = setFields;
+        }
+        if (dto.maxUsdcPerTrade === null) {
+            updateOp.$unset = { maxUsdcPerTrade: "" };
+        }
+
         const updated = await this.targetModel
-            .findByIdAndUpdate(
-                id,
-                {
-                    $set: {
-                        ...(dto.alias !== undefined && { alias: dto.alias }),
-                        ...(dto.proxyAddress !== undefined && {
-                            proxyAddress: dto.proxyAddress.toLowerCase(),
-                        }),
-                        ...(dto.username !== undefined && { username: dto.username }),
-                        ...(dto.enabled !== undefined && { enabled: dto.enabled }),
-                        ...(dto.maxUsdcPerTrade !== undefined && {
-                            maxUsdcPerTrade: dto.maxUsdcPerTrade,
-                        }),
-                        ...(dto.weightMultiplier !== undefined && {
-                            weightMultiplier: dto.weightMultiplier,
-                        }),
-                    },
-                },
-                { new: true }
-            )
+            .findByIdAndUpdate(id, updateOp, { new: true })
             .lean()
             .exec();
 
@@ -168,7 +158,11 @@ export class TargetsService {
             throw new NotFoundException(`Baleine cible introuvable avec l'ID ${id}`);
         }
 
-        const result = this.mapToTrader(updated);
+        const statsMap = await this.getTargetsStatsAggregated();
+        const result = this.mapToTrader(
+            updated,
+            statsMap.get(String(updated.address).toLowerCase())
+        );
         this.eventsGateway.broadcast("target:updated", result);
         return result;
     }
@@ -212,7 +206,9 @@ export class TargetsService {
             alias: String(doc.alias),
             enabled: Boolean(doc.enabled),
             maxUsdcPerTrade:
-                doc.maxUsdcPerTrade !== undefined ? Number(doc.maxUsdcPerTrade) : undefined,
+                doc.maxUsdcPerTrade !== undefined && doc.maxUsdcPerTrade !== null
+                    ? Number(doc.maxUsdcPerTrade)
+                    : undefined,
             weightMultiplier: Number(doc.weightMultiplier ?? 1.0),
             stats,
             createdAt: doc.createdAt instanceof Date ? doc.createdAt.getTime() : Date.now(),

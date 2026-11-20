@@ -5,6 +5,7 @@ import { EventsModule } from "./modules/gateway/events.module.ts";
 import { MetricsModule } from "./modules/metrics/metrics.module.ts";
 import { NotificationsModule } from "./modules/notifications/notifications.module.ts";
 import { PositionsModule } from "./modules/positions/positions.module.ts";
+import { SystemModule } from "./modules/system/system.module.ts";
 import { TargetsModule } from "./modules/targets/targets.module.ts";
 import { TradesModule } from "./modules/trades/trades.module.ts";
 
@@ -13,6 +14,7 @@ import { TradesModule } from "./modules/trades/trades.module.ts";
         DatabaseModule,
         NotificationsModule,
         EventsModule,
+        SystemModule,
         TargetsModule,
         TradesModule,
         PositionsModule,

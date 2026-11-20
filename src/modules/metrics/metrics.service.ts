@@ -1,6 +1,19 @@
+import type {
+    PeriodGranularity,
+    PeriodSummaryItem,
+    PeriodSummaryQueryParsed,
+    PeriodSummaryResponse,
+} from "@lotso-trading/shared";
 import { Injectable } from "@nestjs/common";
 import { InjectModel } from "@nestjs/mongoose";
 import type { Model } from "mongoose";
+import { buildPaginatedResponse, normalizePagination } from "../../common/utils/pagination.util.ts";
+import {
+    buildTimestampMsExpr,
+    CLOSED_POSITION_STATS_ACCUMULATORS,
+    formatClosedPositionsTotals,
+    type RawClosedStatsDoc,
+} from "../../common/utils/position-stats.util.ts";
 import { type ConfigDocument, ConfigModel } from "../../database/schemas/config.schema.ts";
 import { type PositionDocument, PositionModel } from "../../database/schemas/position.schema.ts";
 import { type TargetDocument, TargetModel } from "../../database/schemas/target.schema.ts";
@@ -36,6 +49,105 @@ export interface PerformancePoint {
     myCumulativePnlUsdc: number;
     portfolioValueUsdc: number;
     whaleCumulativeUsdc: number;
+}
+
+const GRANULARITY_DATE_FORMAT: Record<PeriodGranularity, string> = {
+    day: "%Y-%m-%d",
+    week: "%G-W%V",
+    month: "%Y-%m",
+    year: "%Y",
+};
+
+function resolveSafeTimeZone(rawTz?: string): string {
+    const candidate = rawTz?.trim() || "UTC";
+    try {
+        new Intl.DateTimeFormat("fr-FR", { timeZone: candidate });
+        return candidate;
+    } catch {
+        return "UTC";
+    }
+}
+
+function getIsoWeekDateRange(isoYear: number, isoWeek: number): { start: Date; end: Date } {
+    const jan4 = new Date(Date.UTC(isoYear, 0, 4));
+    const jan4Day = jan4.getUTCDay() || 7;
+    const week1Monday = new Date(jan4.getTime() - (jan4Day - 1) * 86_400_000);
+    const start = new Date(week1Monday.getTime() + (isoWeek - 1) * 7 * 86_400_000);
+    const end = new Date(start.getTime() + 6 * 86_400_000 + 86_399_999);
+    return { start, end };
+}
+
+function formatPeriodBucket(
+    periodKey: string,
+    granularity: PeriodGranularity
+): { periodLabel: string; startTimestamp: number; endTimestamp: number } {
+    if (granularity === "day") {
+        const [y, m, d] = periodKey.split("-").map(Number);
+        const start = new Date(Date.UTC(y || 1970, (m || 1) - 1, d || 1, 0, 0, 0, 0));
+        const end = new Date(Date.UTC(y || 1970, (m || 1) - 1, d || 1, 23, 59, 59, 999));
+        const label = start.toLocaleDateString("fr-FR", {
+            day: "numeric",
+            month: "short",
+            year: "numeric",
+            timeZone: "UTC",
+        });
+        return { periodLabel: label, startTimestamp: start.getTime(), endTimestamp: end.getTime() };
+    }
+
+    if (granularity === "week") {
+        const match = /^(\d{4})-W(\d{2})$/.exec(periodKey);
+        if (match) {
+            const year = Number(match[1]);
+            const week = Number(match[2]);
+            const { start, end } = getIsoWeekDateRange(year, week);
+            const startStr = start.toLocaleDateString("fr-FR", {
+                day: "numeric",
+                month: "short",
+                timeZone: "UTC",
+            });
+            const endStr = end.toLocaleDateString("fr-FR", {
+                day: "numeric",
+                month: "short",
+                timeZone: "UTC",
+            });
+            return {
+                periodLabel: `S${String(week).padStart(2, "0")} ${year} (${startStr} – ${endStr})`,
+                startTimestamp: start.getTime(),
+                endTimestamp: end.getTime(),
+            };
+        }
+    }
+
+    if (granularity === "month") {
+        const [y, m] = periodKey.split("-").map(Number);
+        const start = new Date(Date.UTC(y || 1970, (m || 1) - 1, 1, 0, 0, 0, 0));
+        const end = new Date(Date.UTC(y || 1970, m || 1, 0, 23, 59, 59, 999));
+        const rawLabel = start.toLocaleDateString("fr-FR", {
+            month: "long",
+            year: "numeric",
+            timeZone: "UTC",
+        });
+        const label = rawLabel.charAt(0).toUpperCase() + rawLabel.slice(1);
+        return { periodLabel: label, startTimestamp: start.getTime(), endTimestamp: end.getTime() };
+    }
+
+    const year = Number(periodKey) || 1970;
+    const start = new Date(Date.UTC(year, 0, 1, 0, 0, 0, 0));
+    const end = new Date(Date.UTC(year, 11, 31, 23, 59, 59, 999));
+    return {
+        periodLabel: String(year),
+        startTimestamp: start.getTime(),
+        endTimestamp: end.getTime(),
+    };
+}
+
+interface PeriodPositionAggRow extends RawClosedStatsDoc {
+    _id: string;
+}
+
+interface PeriodTradeAggRow {
+    _id: string;
+    tradesCount: number;
 }
 
 @Injectable()
@@ -145,9 +257,14 @@ export class MetricsService {
     }
 
     async getPerformanceHistory(): Promise<PerformancePoint[]> {
-        const [targets, trades, configDoc] = await Promise.all([
+        const [targets, trades, closedPositions, openPositions, configDoc] = await Promise.all([
             this.targetModel.find({}).lean().exec(),
             this.tradeModel.find({ status: "FILLED" }).sort({ executedAt: 1 }).lean().exec(),
+            this.positionModel.find({ status: "CLOSED" }).lean().exec(),
+            this.positionModel
+                .find({ status: { $ne: "CLOSED" }, totalShares: { $gt: 0 } })
+                .lean()
+                .exec(),
             this.configModel.findOne({ key: "singleton" }).lean().exec(),
         ]);
 
@@ -161,52 +278,300 @@ export class MetricsService {
                 Number(Deno.env.get("SIMULATED_BALANCE_USDC")) ??
                 1000.0
         );
-        let runningCash = initialCapital;
+
+        const toMs = (ts: number | undefined): number => {
+            const val = Number(ts || 0);
+            if (val <= 0) return 0;
+            return val < 100_000_000_000 ? val * 1000 : val;
+        };
+        const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+        type TimelineEvent =
+            | { kind: "CLOSE"; timestamp: number; position: (typeof closedPositions)[number] }
+            | { kind: "TRADE"; timestamp: number; trade: (typeof trades)[number] };
+
+        const events: TimelineEvent[] = [];
+        for (const pos of closedPositions) {
+            const ts = toMs(pos.closedAt ?? pos.updatedAt);
+            if (ts > 0) {
+                events.push({ kind: "CLOSE", timestamp: ts, position: pos });
+            }
+        }
+        for (const trade of trades) {
+            const ts = toMs(trade.executedAt);
+            if (ts > 0) {
+                events.push({ kind: "TRADE", timestamp: ts, trade });
+            }
+        }
+
+        events.sort((a, b) => {
+            if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+            // Applique la clôture avant le trade au même horodatage (ex: WHALE_SELL)
+            if (a.kind === b.kind) return 0;
+            return a.kind === "CLOSE" ? -1 : 1;
+        });
+
         let runningCumulativePnl = 0.0;
         let runningWhaleVolume = 0.0;
 
         const points: PerformancePoint[] = [];
 
-        // Point initial de départ
-        const firstTrade = trades[0];
+        const firstEvent = events[0];
         const startTimestamp =
-            firstTrade !== undefined ? firstTrade.executedAt - 60000 : Date.now() - 3600000;
+            firstEvent !== undefined ? firstEvent.timestamp - 60000 : Date.now() - 3600000;
         points.push({
             timestamp: startTimestamp,
             myCumulativePnlUsdc: 0,
-            portfolioValueUsdc: initialCapital,
+            portfolioValueUsdc: round2(initialCapital),
             whaleCumulativeUsdc: 0,
         });
 
-        for (const trade of trades) {
-            const alias =
-                targetMap.get(trade.targetAddress.toLowerCase()) || trade.targetAddress.slice(0, 8);
-            runningWhaleVolume += trade.costUsdc;
+        for (let i = 0; i < events.length; i++) {
+            const evt = events[i];
+            if (!evt) continue;
+            if (evt.kind === "CLOSE") {
+                runningCumulativePnl += Number(evt.position.realizedPnlUsdc || 0);
+                const nextEvt = events[i + 1];
+                // Si un trade (ex. SELL) survient au même timestamp, il portera l'état mis à jour
+                if (nextEvt && nextEvt.kind === "TRADE" && nextEvt.timestamp === evt.timestamp) {
+                    continue;
+                }
+                const targetAddr = evt.position.targetAddress?.toLowerCase();
+                const alias = targetAddr
+                    ? targetMap.get(targetAddr) || targetAddr.slice(0, 8)
+                    : undefined;
+                points.push({
+                    timestamp: evt.timestamp,
+                    targetAddress: evt.position.targetAddress,
+                    targetAlias: alias,
+                    myCumulativePnlUsdc: round2(runningCumulativePnl),
+                    portfolioValueUsdc: Math.max(0, round2(initialCapital + runningCumulativePnl)),
+                    whaleCumulativeUsdc: round2(runningWhaleVolume),
+                });
+            } else {
+                const trade = evt.trade;
+                const alias =
+                    targetMap.get(trade.targetAddress.toLowerCase()) ||
+                    trade.targetAddress.slice(0, 8);
+                runningWhaleVolume += Number(trade.costUsdc || 0);
 
-            if (trade.side === "BUY") {
-                runningCash = Math.max(0, runningCash - trade.costUsdc);
-            } else if (trade.side === "SELL") {
-                runningCash += trade.costUsdc;
-                runningCumulativePnl += (trade.executedPrice - trade.targetPrice) * trade.shares;
+                points.push({
+                    timestamp: evt.timestamp,
+                    tradeId: trade.tradeId,
+                    side: trade.side,
+                    shares: trade.shares,
+                    price: trade.executedPrice,
+                    costUsdc: trade.costUsdc,
+                    targetAddress: trade.targetAddress,
+                    targetAlias: alias,
+                    myCumulativePnlUsdc: round2(runningCumulativePnl),
+                    portfolioValueUsdc: Math.max(0, round2(initialCapital + runningCumulativePnl)),
+                    whaleCumulativeUsdc: round2(runningWhaleVolume),
+                });
             }
+        }
 
+        // Ancre le point final sur la valorisation live exacte (cash libre + valeur au carnet des positions ouvertes)
+        const openInvested = openPositions.reduce(
+            (acc, p) => acc + Number(p.totalInvestedUsdc || 0),
+            0
+        );
+        const openCurrentValue = openPositions.reduce(
+            (acc, p) => acc + Number(p.currentMarketValueUsdc || 0),
+            0
+        );
+        const availableCash = Math.max(0, initialCapital - openInvested + runningCumulativePnl);
+        const livePortfolioValue = round2(availableCash + openCurrentValue);
+        const lastPoint = points[points.length - 1];
+
+        if (
+            lastPoint &&
+            (events.length > 0 || openPositions.length > 0) &&
+            Math.abs(livePortfolioValue - lastPoint.portfolioValueUsdc) > 0.005
+        ) {
             points.push({
-                timestamp: trade.executedAt,
-                tradeId: trade.tradeId,
-                side: trade.side,
-                shares: trade.shares,
-                price: trade.executedPrice,
-                costUsdc: trade.costUsdc,
-                targetAddress: trade.targetAddress,
-                targetAlias: alias,
-                myCumulativePnlUsdc: Math.round(runningCumulativePnl * 100) / 100,
-                portfolioValueUsdc:
-                    Math.round((runningCash + (trade.side === "BUY" ? trade.costUsdc : 0)) * 100) /
-                    100,
-                whaleCumulativeUsdc: Math.round(runningWhaleVolume * 100) / 100,
+                timestamp: Math.max(Date.now(), lastPoint.timestamp + 1),
+                myCumulativePnlUsdc: round2(runningCumulativePnl),
+                portfolioValueUsdc: livePortfolioValue,
+                whaleCumulativeUsdc: round2(runningWhaleVolume),
             });
         }
 
         return points;
+    }
+
+    async getPeriodSummary(query: PeriodSummaryQueryParsed): Promise<PeriodSummaryResponse> {
+        const granularity = query.granularity;
+        const timezone = resolveSafeTimeZone(query.tz);
+        const dateFormat = GRANULARITY_DATE_FORMAT[granularity];
+        const { page, limit, skip } = normalizePagination(query.page, query.limit, 20, 100);
+
+        const [positionRows, tradeRows] = await Promise.all([
+            this.positionModel.aggregate<PeriodPositionAggRow>([
+                { $match: { status: "CLOSED" } },
+                {
+                    $addFields: {
+                        effectiveTsMs: buildTimestampMsExpr("$closedAt", "$updatedAt"),
+                    },
+                },
+                {
+                    $addFields: {
+                        periodKey: {
+                            $dateToString: {
+                                format: dateFormat,
+                                date: { $toDate: "$effectiveTsMs" },
+                                timezone,
+                            },
+                        },
+                    },
+                },
+                {
+                    $group: {
+                        _id: "$periodKey",
+                        ...CLOSED_POSITION_STATS_ACCUMULATORS,
+                    },
+                },
+            ]),
+            this.tradeModel.aggregate<PeriodTradeAggRow>([
+                { $match: { status: "FILLED" } },
+                {
+                    $addFields: {
+                        effectiveTsMs: buildTimestampMsExpr("$executedAt", "$executedAt"),
+                    },
+                },
+                {
+                    $addFields: {
+                        periodKey: {
+                            $dateToString: {
+                                format: dateFormat,
+                                date: { $toDate: "$effectiveTsMs" },
+                                timezone,
+                            },
+                        },
+                    },
+                },
+                {
+                    $group: {
+                        _id: "$periodKey",
+                        tradesCount: { $sum: 1 },
+                    },
+                },
+            ]),
+        ]);
+
+        const tradeCountMap = new Map<string, number>();
+        for (const tr of tradeRows) {
+            if (tr._id) {
+                tradeCountMap.set(tr._id, Number(tr.tradesCount || 0));
+            }
+        }
+
+        const posRowMap = new Map<string, PeriodPositionAggRow>();
+        for (const pr of positionRows) {
+            if (pr._id) {
+                posRowMap.set(pr._id, pr);
+            }
+        }
+
+        const allKeys = new Set<string>([...posRowMap.keys(), ...tradeCountMap.keys()]);
+
+        const allPeriods: PeriodSummaryItem[] = [];
+        const globalAccumulator: RawClosedStatsDoc = {
+            count: 0,
+            totalInvested: 0,
+            totalPayout: 0,
+            totalGains: 0,
+            totalLosses: 0,
+            netPnl: 0,
+            totalShares: 0,
+            winCount: 0,
+            lossCount: 0,
+        };
+
+        for (const periodKey of allKeys) {
+            const rawStats = posRowMap.get(periodKey);
+            const formatted = formatClosedPositionsTotals(rawStats);
+            const bucket = formatPeriodBucket(periodKey, granularity);
+
+            globalAccumulator.count = (globalAccumulator.count || 0) + formatted.count;
+            globalAccumulator.totalInvested =
+                (globalAccumulator.totalInvested || 0) + formatted.totalInvested;
+            globalAccumulator.totalPayout =
+                (globalAccumulator.totalPayout || 0) + formatted.totalPayout;
+            globalAccumulator.totalGains =
+                (globalAccumulator.totalGains || 0) + formatted.totalGains;
+            globalAccumulator.totalLosses =
+                (globalAccumulator.totalLosses || 0) + formatted.totalLosses;
+            globalAccumulator.netPnl = (globalAccumulator.netPnl || 0) + formatted.netPnl;
+            globalAccumulator.totalShares =
+                (globalAccumulator.totalShares || 0) + formatted.totalShares;
+            globalAccumulator.winCount = (globalAccumulator.winCount || 0) + formatted.winCount;
+            globalAccumulator.lossCount = (globalAccumulator.lossCount || 0) + formatted.lossCount;
+
+            allPeriods.push({
+                periodKey,
+                periodLabel: bucket.periodLabel,
+                startTimestamp: bucket.startTimestamp,
+                endTimestamp: bucket.endTimestamp,
+                tradesCount: tradeCountMap.get(periodKey) ?? 0,
+                ...formatted,
+            });
+        }
+
+        const totals = formatClosedPositionsTotals(globalAccumulator);
+
+        let bestPeriod: PeriodSummaryItem | null = null;
+        let worstPeriod: PeriodSummaryItem | null = null;
+        for (const item of allPeriods) {
+            if (item.count === 0) continue;
+            if (!bestPeriod || item.netPnl > bestPeriod.netPnl) {
+                bestPeriod = item;
+            }
+            if (!worstPeriod || item.netPnl < worstPeriod.netPnl) {
+                worstPeriod = item;
+            }
+        }
+
+        const periodsWithClosures = allPeriods.filter((p) => p.count > 0);
+        const avgNetPnlPerPeriod =
+            periodsWithClosures.length > 0
+                ? Math.round((totals.netPnl / periodsWithClosures.length) * 100) / 100
+                : 0;
+
+        const dir = query.sortOrder === "asc" ? 1 : -1;
+        allPeriods.sort((a, b) => {
+            let cmp = 0;
+            switch (query.sortBy) {
+                case "period":
+                    cmp = a.periodKey.localeCompare(b.periodKey);
+                    break;
+                case "count":
+                    cmp = a.count - b.count;
+                    break;
+                case "winRate":
+                    cmp = a.winRate - b.winRate;
+                    break;
+                case "totalInvested":
+                    cmp = a.totalInvested - b.totalInvested;
+                    break;
+                case "netPnl":
+                    cmp = a.netPnl - b.netPnl;
+                    break;
+                case "roiPercent":
+                    cmp = a.roiPercent - b.roiPercent;
+                    break;
+            }
+            if (cmp !== 0) return cmp * dir;
+            return b.periodKey.localeCompare(a.periodKey);
+        });
+
+        const pagedItems = allPeriods.slice(skip, skip + limit);
+        return buildPaginatedResponse(pagedItems, allPeriods.length, page, limit, {
+            granularity,
+            totals,
+            bestPeriod,
+            worstPeriod,
+            avgNetPnlPerPeriod,
+        });
     }
 }

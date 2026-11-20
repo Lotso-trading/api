@@ -9,7 +9,6 @@ import { DiscordNotifierService } from "../src/modules/notifications/discord-not
 import { PositionsService } from "../src/modules/positions/positions.service.ts";
 
 Deno.test("DiscordNotifierService - déduplique et refuse les alertes multiples pour la même position", async () => {
-    // Configurer une URL factice de webhook pour le test
     Deno.env.set(
         "DISCORD_CLOSED_POSITIONS_WEBHOOK_URL",
         "https://discord.com/api/webhooks/test/mock"
@@ -45,11 +44,9 @@ Deno.test("DiscordNotifierService - déduplique et refuse les alertes multiples 
             updatedAt: Date.now(),
         };
 
-        // Premier envoi -> doit passer
         await notifier.sendClosedPositionAlert(mockPosition, "RN1");
         assertEquals(fetchCallCount, 1);
 
-        // Envois concurrents / successifs pour la même position -> doivent être bloqués par le cache de déduplication
         await notifier.sendClosedPositionAlert(mockPosition, "RN1");
         await notifier.sendClosedPositionAlert(mockPosition, "RN1");
         await notifier.sendClosedPositionAlert(mockPosition, "RN1");
@@ -61,63 +58,150 @@ Deno.test("DiscordNotifierService - déduplique et refuse les alertes multiples 
     }
 });
 
-Deno.test("PositionsService - single-flight mutex mutualise les appels concurrents de settlement", async () => {
-    let dbFindCount = 0;
-    const mockPositionModel = {
-        find: () => {
-            dbFindCount++;
-            return {
-                exec: () =>
-                    new Promise((resolve) => {
-                        setTimeout(() => resolve([]), 30);
-                    }),
-            };
+Deno.test("PositionsService - requestPositionSync délègue au bot via WebSocket sans appeler Polymarket", () => {
+    let sentEvent = "";
+    const mockGatewayOnline = {
+        isBotConnected: () => true,
+        sendToBots: (event: string) => {
+            sentEvent = event;
+            return true;
         },
-        findOneAndUpdate: () => Promise.resolve(null),
-    };
-
-    const mockTargetModel = {
-        findOne: () => ({ lean: () => ({ exec: () => Promise.resolve(null) }) }),
-    };
-
-    const mockEventsGateway = {
         broadcast: () => {},
     } as unknown as EventsGateway;
 
-    const mockDiscordNotifier = {
-        sendClosedPositionAlert: () => Promise.resolve(),
+    const serviceOnline = new PositionsService(
+        {} as unknown as Model<PositionDocument>,
+        {} as unknown as Model<TargetDocument>,
+        mockGatewayOnline,
+        {} as unknown as DiscordNotifierService
+    );
+
+    const resOnline = serviceOnline.requestPositionSync();
+    assertEquals(resOnline.requested, true);
+    assertEquals(resOnline.botOnline, true);
+    assertEquals(sentEvent, "bot:check-resolutions");
+
+    const mockGatewayOffline = {
+        isBotConnected: () => false,
+        sendToBots: () => false,
+        broadcast: () => {},
+    } as unknown as EventsGateway;
+
+    const serviceOffline = new PositionsService(
+        {} as unknown as Model<PositionDocument>,
+        {} as unknown as Model<TargetDocument>,
+        mockGatewayOffline,
+        {} as unknown as DiscordNotifierService
+    );
+
+    const resOffline = serviceOffline.requestPositionSync();
+    assertEquals(resOffline.requested, false);
+    assertEquals(resOffline.botOnline, false);
+});
+
+Deno.test("PositionsService - closePosition persiste de manière atomique, met à jour les stats et diffuse position:closed", async () => {
+    let alreadyClosed = false;
+    let broadcastCount = 0;
+    let discordAlertCount = 0;
+    let targetUpdated = false;
+
+    const mockPos = {
+        _id: "pos_atomic_test",
+        positionId: "pos_atomic_test",
+        conditionId: "0x9876543210abcdef9876543210abcdef9876543210abcdef9876543210abcdef",
+        assetAddress: "0x1111111111111111111111111111111111111111",
+        marketSlug: "slug-worldcup",
+        marketQuestion: "France vs Brazil?",
+        outcomeLabel: "France",
+        status: "OPEN",
+        totalShares: 100,
+        avgEntryPrice: 0.5,
+        totalInvestedUsdc: 50,
+        currentMarketPrice: 0.5,
+        currentMarketValueUsdc: 50,
+        unrealizedPnlUsdc: 0,
+        unrealizedPnlPercent: 0,
+        targetAddress: "0x2005d16a84ceefa912d4e380cd32e7ff827875ea",
+        openedAt: 1730000000000,
+        updatedAt: 1730000000000,
+    };
+
+    const mockPositionModel = {
+        findOne: () => Promise.resolve(alreadyClosed ? null : mockPos),
+        findOneAndUpdate: (_filter: unknown, update: { $set: Record<string, unknown> }) => {
+            if (alreadyClosed) return Promise.resolve(null);
+            alreadyClosed = true;
+            return Promise.resolve({
+                ...mockPos,
+                ...update.$set,
+                toObject: () => ({ ...mockPos, ...update.$set }),
+            });
+        },
+    };
+
+    const mockTargetModel = {
+        findOne: () => ({ lean: () => ({ exec: () => Promise.resolve({ alias: "RN1" }) }) }),
+        updateOne: () => {
+            targetUpdated = true;
+            return Promise.resolve({ modifiedCount: 1 });
+        },
+    };
+
+    const mockGateway = {
+        broadcast: (event: string) => {
+            if (event === "position:closed") broadcastCount++;
+        },
+    } as unknown as EventsGateway;
+
+    const mockNotifier = {
+        sendClosedPositionAlert: () => {
+            discordAlertCount++;
+            return Promise.resolve();
+        },
     } as unknown as DiscordNotifierService;
 
     const service = new PositionsService(
         mockPositionModel as unknown as Model<PositionDocument>,
         mockTargetModel as unknown as Model<TargetDocument>,
-        mockEventsGateway,
-        mockDiscordNotifier
+        mockGateway,
+        mockNotifier
     );
 
-    // Lancement de 5 appels concurrents avec force = true
-    const results = await Promise.all([
-        service.settleResolvedPositions(true),
-        service.settleResolvedPositions(true),
-        service.settleResolvedPositions(true),
-        service.settleResolvedPositions(true),
-        service.settleResolvedPositions(true),
-    ]);
+    const first = await service.closePosition(mockPos.conditionId, {
+        closeReason: "RESOLVED_WIN",
+        winningOutcome: "France",
+    });
+    const second = await service.closePosition(mockPos.conditionId, {
+        closeReason: "RESOLVED_WIN",
+        winningOutcome: "France",
+    });
 
-    // Grâce au single-flight mutex, une seule exécution réelle a été lancée
-    assertEquals(dbFindCount, 1, "Une seule requête réelle en base doit être exécutée");
-    assertEquals(results, [0, 0, 0, 0, 0]);
+    assertEquals(first?.status, "CLOSED");
+    assertEquals(first?.settledPayoutUsdc, 100);
+    assertEquals(first?.realizedPnlUsdc, 50);
+    assertEquals(second, null);
+    assertEquals(broadcastCount, 1);
+    assertEquals(discordAlertCount, 1);
+    assertEquals(targetUpdated, true);
 });
 
-Deno.test("PositionsService - throttling bloque les exécutions automatiques trop rapprochées", async () => {
-    let dbFindCount = 0;
+Deno.test("PositionsService - getClosedSummary agrège toutes les positions clôturées sans limite de 100", async () => {
     const mockPositionModel = {
-        find: () => {
-            dbFindCount++;
-            return {
-                exec: () => Promise.resolve([]),
-            };
-        },
+        aggregate: () =>
+            Promise.resolve([
+                {
+                    _id: null,
+                    count: 240,
+                    totalInvested: 12000,
+                    totalPayout: 15600,
+                    netPnl: 3600,
+                    totalShares: 15600,
+                    winCount: 180,
+                    lossCount: 60,
+                    totalGains: 5100,
+                    totalLosses: 1500,
+                },
+            ]),
     };
 
     const service = new PositionsService(
@@ -127,18 +211,16 @@ Deno.test("PositionsService - throttling bloque les exécutions automatiques tro
         {} as unknown as DiscordNotifierService
     );
 
-    // Premier appel automatique -> exécuté
-    const first = await service.settleResolvedPositions(false);
-    assertEquals(first, 0);
-    assertEquals(dbFindCount, 1);
-
-    // Deuxième appel automatique immédiat -> bloqué par le throttling (retourne 0 sans interroger la DB)
-    const second = await service.settleResolvedPositions(false);
-    assertEquals(second, 0);
-    assertEquals(dbFindCount, 1, "Le throttling doit empêcher l'exécution");
+    const summary = await service.getClosedSummary();
+    assertEquals(summary.count, 240);
+    assertEquals(summary.winCount, 180);
+    assertEquals(summary.lossCount, 60);
+    assertEquals(summary.netPnl, 3600);
+    assertEquals(summary.winRate, 75);
+    assertEquals(summary.roiPercent, 30);
 });
 
-Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pagination et calcul des totaux", async () => {
+Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pagination (20 par défaut) et totaux", async () => {
     const mockAggregationResult = [
         {
             items: [
@@ -200,12 +282,12 @@ Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pa
 
     const paginated = await service.findClosedPaginated({
         page: 2,
-        limit: 25,
+        limit: 20,
         status: "WIN",
     });
 
     assertEquals(paginated.page, 2);
-    assertEquals(paginated.limit, 25);
+    assertEquals(paginated.limit, 20);
     assertEquals(paginated.total, 55);
     assertEquals(paginated.totalPages, 3);
     assertEquals(paginated.items.length, 1);
@@ -214,8 +296,6 @@ Deno.test("PositionsService - findClosedPaginated exécute l'agrégation avec pa
     assertEquals(paginated.totals.winCount, 40);
     assertEquals(paginated.totals.lossCount, 15);
     assertEquals(paginated.totals.netPnl, 1250);
-    assertEquals(paginated.totals.totalInvested, 2750);
-    assertEquals(paginated.totals.totalPayout, 4000);
 });
 
 Deno.test("PositionsService - findUnredeemedWinningPositions filtre les positions gagnantes sans tx de rachat", async () => {
@@ -336,11 +416,9 @@ Deno.test("PositionsService - resolveMarketEndDate résout la date via Gamma API
     globalThis.fetch = ((url: string | URL | Request) => {
         fetchCount++;
         const urlStr = String(url);
-        // 1. CLOB échoue
         if (urlStr.includes("clob.polymarket.com")) {
             return Promise.resolve(new Response("Not Found", { status: 404 }));
         }
-        // 2. Gamma réussit
         if (urlStr.includes("gamma-api.polymarket.com/markets?condition_ids=")) {
             return Promise.resolve(
                 new Response(
@@ -370,99 +448,9 @@ Deno.test("PositionsService - resolveMarketEndDate résout la date via Gamma API
         const resolved = await service.resolveMarketEndDate(mockConditionId, "test-market");
         assertEquals(resolved, "2026-11-20T18:00:00Z");
 
-        // Second appel -> doit provenir du cache (fetchCount ne doit pas augmenter)
         const cached = await service.resolveMarketEndDate(mockConditionId, "test-market");
         assertEquals(cached, "2026-11-20T18:00:00Z");
-        assertEquals(fetchCount, 2); // 1 CLOB + 1 Gamma = 2 fetches au 1er appel, 0 au 2e
-    } finally {
-        globalThis.fetch = originalFetch;
-    }
-});
-
-Deno.test("PositionsService - settleResolvedPositions clôture via Gamma API quand CLOB échoue", async () => {
-    const originalFetch = globalThis.fetch;
-    const mockConditionId = "0x9876543210abcdef9876543210abcdef9876543210abcdef9876543210abcdef";
-    let settledCalled = false;
-
-    const mockPos = {
-        _id: "pos_gamma_test",
-        conditionId: mockConditionId,
-        assetAddress: "0x1111111111111111111111111111111111111111",
-        marketSlug: "slug-worldcup",
-        marketQuestion: "France vs Brazil?",
-        outcomeLabel: "France",
-        status: "OPEN",
-        totalShares: 100,
-        avgEntryPrice: 0.5,
-        totalInvestedUsdc: 50,
-        currentMarketPrice: 0.5,
-        currentMarketValueUsdc: 50,
-    };
-
-    const mockPositionModel = {
-        find: () => ({
-            exec: () => Promise.resolve([mockPos]),
-        }),
-        findOne: () => Promise.resolve(mockPos),
-        findOneAndUpdate: (
-            _filter: unknown,
-            update: { $set: { status: string; closeReason: string } }
-        ) => {
-            settledCalled = true;
-            assertEquals(update.$set.status, "CLOSED");
-            assertEquals(update.$set.closeReason, "RESOLVED_WIN");
-            return Promise.resolve({
-                ...mockPos,
-                ...update.$set,
-                toObject: () => ({ ...mockPos, ...update.$set }),
-            });
-        },
-        updateOne: () => Promise.resolve({}),
-    };
-
-    globalThis.fetch = ((url: string | URL | Request) => {
-        const urlStr = String(url);
-        // CLOB échoue ou ne renvoie pas encore de winner
-        if (urlStr.includes("clob.polymarket.com")) {
-            return Promise.resolve(
-                new Response(JSON.stringify({ closed: true, tokens: [] }), { status: 200 })
-            );
-        }
-        // Gamma renvoie le résultat avec outcomePrices
-        if (urlStr.includes("gamma-api.polymarket.com")) {
-            return Promise.resolve(
-                new Response(
-                    JSON.stringify([
-                        {
-                            conditionId: mockConditionId,
-                            closed: true,
-                            endDate: "2026-11-15T20:00:00Z",
-                            outcomes: JSON.stringify(["France", "Brazil"]),
-                            outcomePrices: JSON.stringify(["1", "0"]),
-                        },
-                    ]),
-                    { status: 200 }
-                )
-            );
-        }
-        return Promise.resolve(new Response("{}", { status: 404 }));
-    }) as typeof fetch;
-
-    try {
-        const service = new PositionsService(
-            mockPositionModel as unknown as Model<PositionDocument>,
-            {
-                findOne: () => ({ lean: () => ({ exec: () => Promise.resolve(null) }) }),
-            } as unknown as Model<TargetDocument>,
-            { broadcast: () => {} } as unknown as EventsGateway,
-            {
-                sendClosedPositionAlert: () => Promise.resolve(),
-            } as unknown as DiscordNotifierService
-        );
-
-        const count = await service.settleResolvedPositions(true);
-        assertEquals(count, 1);
-        assertEquals(settledCalled, true);
+        assertEquals(fetchCount, 2);
     } finally {
         globalThis.fetch = originalFetch;
     }
@@ -484,7 +472,8 @@ Deno.test("PositionsService - resolveMarketMetadata ignore un premier résultat 
                 new Response(
                     JSON.stringify([
                         {
-                            conditionId: "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
+                            conditionId:
+                                "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7",
                             slug: "xi-jinping-out-before-2027",
                             events: [{ slug: "xi-jinping-out-before-2027" }],
                         },
